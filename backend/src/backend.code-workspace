@@ -1,0 +1,15 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../frontend"
+		},
+		{
+			"name": "fullstack-todo",
+			"path": "../.."
+		}
+	],
+	"settings": {}
+}

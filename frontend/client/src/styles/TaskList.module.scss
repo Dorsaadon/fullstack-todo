@@ -1,0 +1,57 @@
+.taskListContainer {
+    display: flex;
+    flex-direction: column;
+    flex: 0 0 25%;
+    gap: 20px;
+    margin-top: 30px;
+    width:100%;
+    margin-bottom:50px;
+  }
+  
+  .taskItem {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: #fff;
+    padding: 15px;
+    border-radius: 5px;
+    box-shadow: 0 1px 5px rgba(0, 0, 0, 0.1);
+  }
+  
+  .taskDetails {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    flex-basis:70%;
+  }
+  
+  .taskDetails h4 {
+    margin-bottom: 5px;
+    font-size: 18px;
+  }
+  
+  .taskActions {
+    margin: auto 0;
+    display: flex;
+    gap: 10px;
+    flex-basis:10%;
+  }
+  
+  button {
+    padding: 8px 12px;
+    background: #28a745;
+    color: white;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    flex-basis:10%;
+  }
+  
+  button.delete {
+    background: #dc3545;
+  }
+  
+  button:hover {
+    opacity: 0.9;
+  }
+  
