@@ -133,7 +133,7 @@ def test_demo_runs_in_streaming_mode(no_kill_file):
         await engine.start()
         await asyncio.wait_for(engine.run(max_ticks=5), 10)
         await engine.close()
-        assert len(engine.hub.books) == 10
+        assert len(engine.hub.books) == 12
 
     asyncio.run(main())
 

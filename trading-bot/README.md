@@ -2,8 +2,9 @@
 
 A multi-venue, multi-strategy trading bot for **US equities (Alpaca)**, **crypto
 (Binance, Kraken and 100+ others via ccxt)** and **prediction markets
-(Polymarket)**. It runs four strategies: cross-exchange arbitrage, triangular
-arbitrage, prediction-market basket arbitrage and mean reversion.
+(Polymarket)**. It runs five strategies: cross-exchange arbitrage, triangular
+arbitrage, prediction-market basket arbitrage, opening range breakout and
+mean reversion.
 
 It is built so that you can go **demo → paper → small live → scale** without
 rewriting anything. The same strategy code runs at every stage, and every order
@@ -14,8 +15,8 @@ cd trading-bot
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[all,dev]"
 
-python -m tradebot run -c config/demo.toml --ticks 40   # offline, no keys
-pytest                                                  # 33 tests
+python -m tradebot run -c config/demo.toml --ticks 150  # offline, no keys
+pytest                                                  # 53 tests
 ```
 
 ## Architecture
@@ -36,7 +37,8 @@ pytest                                                  # 33 tests
 | Models | `models.py` | `OrderBook`, `OrderRequest`, `TradePlan`… All money is `Decimal`. |
 | Venues | `exchanges/` | One `Exchange` interface. `PaperExchange` simulates fills against any data source. |
 | Strategies | `strategies/` | Pure decision functions: snapshot in, `TradePlan`s out. They never place orders. |
-| Risk | `risk/` | Per-order and per-position caps, daily loss halt, order-rate limit, stale-data guard, kill switch. |
+| Risk | `risk/` | Per-order and per-position caps, daily loss halt, order-rate limit, stale-data guard, market-hours gate, kill switch. |
+| Market hours | `market_hours.py` | NYSE sessions, holidays and early closes, computed from the exchange's rules. |
 | Market data | `marketdata.py` | One stream per venue. Keeps the latest books, reconnects with backoff, tracks feed health. |
 | Engine | `engine.py` | Event-driven loop. Fires a plan's legs concurrently and **unwinds uneven fills** (legging risk). |
 | Config | `config.py`, `config/*.toml` | Everything is declared in TOML. Secrets come from env vars. |
@@ -76,11 +78,49 @@ uses REST.
 | `cross_exchange_arb` | crypto | Buy on venue A, sell on venue B at the same moment, from inventory pre-funded on both | One leg fills and the other doesn't. Inventory drifts to one side. |
 | `triangular_arb` | one crypto venue | USDT→BTC→ETH→USDT where the cross rate is mispriced | Edges are tiny and contested. Fees decide everything. |
 | `prediction_market_arb` | Polymarket | Outcomes are exhaustive and exactly one pays $1, so asks summing below $1 is locked-in profit | An outcome missing from the basket. Resolution or oracle disputes. Capital locked until resolution. |
+| `opening_range_breakout` | stocks | Record the first N minutes' high and low, buy the break above, stop at the low, flatten before the close | **Directional.** False breakouts are common; the stop and the daily flatten cap the damage. |
 | `mean_reversion` | stocks | Buy at z ≤ −entry, exit when price reverts | **Directional market risk.** It is not arbitrage. Backtest it first. |
 
 Every arbitrage strategy sizes trades by walking order-book depth, after fees.
 It picks the size with the largest absolute profit that still clears
 `min_edge_bps`.
+
+### Opening range breakout
+
+The classic first day-trading bot. Each trading day, for each symbol:
+
+1. **Range:** track the high and low of the first `range_minutes` (5–30 is typical).
+2. **Entry:** buy when the ask clears the range high plus `breakout_buffer_bps`,
+   but only until `entry_cutoff_minutes` after the open. Days whose range is
+   narrower than `min_range_bps` or wider than `max_range_bps` are skipped.
+3. **Size by risk:** shares = `risk_per_trade` / (entry − range low), so a
+   stopped-out trade loses about `risk_per_trade`. Capped by
+   `max_position_notional` and cash.
+4. **Exit:** stop at the range low, target at `take_profit_r` × risk, and
+   always flatten `flatten_minutes_before_close` before the close (so 12:55
+   on a 1:00 pm early close). Nothing is held overnight.
+
+One round trip per symbol per day. Long only for now. If the bot starts after
+the opening range has ended, it sits that day out rather than guess the range.
+
+## Market hours
+
+`market_hours.py` computes NYSE regular sessions, all exchange holidays and
+the 1:00 pm early closes from the exchange's own rules. It needs no data files
+or API calls, handles daylight saving, and is tested against published NYSE
+calendars.
+
+- Venues with `market_hours = "us_equities"` (the default for `kind = "alpaca"`)
+  get a **hard gate in the risk manager**: any order outside the regular
+  session is refused, whatever the strategy does.
+- Closures nobody can schedule (national days of mourning, like 2025-01-09)
+  go in `[market_calendar] extra_holidays`.
+- `market_hours = "demo"` runs short back-to-back sessions so intraday
+  strategies can be watched end to end at any hour. The demo config uses it.
+- Only regular hours (9:30–16:00 ET) are modelled, not pre-market or after-hours.
+
+Both stock strategies (ORB and mean reversion) only ever sell shares they
+bought themselves, so they never touch other holdings in the same account.
 
 ## The road from here: what to do, in order
 

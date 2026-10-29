@@ -12,15 +12,25 @@ from .engine import Engine
 from .exchanges.base import Exchange
 from .exchanges.paper import PaperExchange
 from .journal import Journal
+from .market_hours import MarketCalendar, RollingSessionCalendar
 from .risk import RiskLimits, RiskManager
-from .strategies import CrossExchangeArbitrage, MeanReversion, PredictionMarketArbitrage, TriangularArbitrage
+from .strategies import (
+    CrossExchangeArbitrage,
+    MeanReversion,
+    OpeningRangeBreakout,
+    PredictionMarketArbitrage,
+    TriangularArbitrage,
+)
 
 STRATEGIES = {
     "cross_exchange_arb": CrossExchangeArbitrage,
     "prediction_market_arb": PredictionMarketArbitrage,
     "triangular_arb": TriangularArbitrage,
     "mean_reversion": MeanReversion,
+    "opening_range_breakout": OpeningRangeBreakout,
 }
+
+VENUE_ONLY_KEYS = ("kind", "taker_fee", "paper_balances", "market_hours", "demo_session_minutes", "demo_gap_minutes")
 
 
 class ConfigError(ValueError):
@@ -61,7 +71,7 @@ def _build_live_adapter(name: str, cfg: dict, live: bool, synthetic_market) -> E
 
         if synthetic_market is None:
             raise ConfigError("synthetic venues need a [synthetic] section")
-        opts = {k: v for k, v in cfg.items() if k not in ("kind", "taker_fee", "paper_balances")}
+        opts = {k: v for k, v in cfg.items() if k not in VENUE_ONLY_KEYS}
         return SyntheticExchange(name, synthetic_market, **opts)
     if kind == "ccxt":
         from .exchanges.ccxt_exchange import CcxtExchange
@@ -98,7 +108,21 @@ def _build_live_adapter(name: str, cfg: dict, live: bool, synthetic_market) -> E
     raise ConfigError(f"venue {name}: unknown kind {kind!r}")
 
 
-def _build_strategy(cfg: dict, fees: dict[str, Decimal], exchanges: dict[str, Exchange]):
+def _build_calendar(name: str, vcfg: dict, global_cfg: dict) -> MarketCalendar | None:
+    """Trading hours for a venue. Alpaca defaults to US equities; others are 24/7."""
+    hours = vcfg.get("market_hours", "us_equities" if vcfg.get("kind") == "alpaca" else None)
+    if hours is None:
+        return None
+    if hours == "us_equities":
+        return MarketCalendar(global_cfg.get("extra_holidays", ()), global_cfg.get("extra_early_closes", ()))
+    if hours == "demo":
+        return RollingSessionCalendar(vcfg.get("demo_session_minutes", 5.0), vcfg.get("demo_gap_minutes", 0.0))
+    raise ConfigError(f"venue {name}: market_hours must be 'us_equities' or 'demo'")
+
+
+def _build_strategy(
+    cfg: dict, fees: dict[str, Decimal], exchanges: dict[str, Exchange], calendars: dict[str, MarketCalendar]
+):
     cfg = dict(cfg)
     kind = cfg.pop("kind", None)
     cls = STRATEGIES.get(kind)
@@ -109,8 +133,13 @@ def _build_strategy(cfg: dict, fees: dict[str, Decimal], exchanges: dict[str, Ex
     unknown = set(cfg) - set(params)
     if unknown:
         raise ConfigError(f"strategy {cfg['name']}: unknown options {sorted(unknown)}")
-    if cls is CrossExchangeArbitrage and "quote_currency" not in cfg:
-        cfg["quote_currency"] = exchanges[cfg["venues"][0]].quote_currency
+    if "quote_currency" in params and "quote_currency" not in cfg:
+        venue = cfg["venues"][0] if "venues" in cfg else cfg["venue"]
+        cfg["quote_currency"] = exchanges[venue].quote_currency
+    if "calendar" in params:
+        if "calendar" in cfg:
+            raise ConfigError(f"strategy {cfg['name']}: set market hours on the venue, not the strategy")
+        cfg["calendar"] = calendars.get(cfg["venue"]) or MarketCalendar()
     for key, p in params.items():
         if key in cfg and "Decimal" in str(p.annotation):
             cfg[key] = Decimal(str(cfg[key]))
@@ -139,7 +168,11 @@ def build_engine(path: str | Path, live: bool = False) -> Engine:
         )
 
     exchanges: dict[str, Exchange] = {}
+    calendars: dict[str, MarketCalendar] = {}
     for name, vcfg in cfg.get("venues", {}).items():
+        cal = _build_calendar(name, vcfg, cfg.get("market_calendar", {}))
+        if cal is not None:
+            calendars[name] = cal
         adapter = _build_live_adapter(name, vcfg, live, market)
         if live:
             if vcfg.get("kind") == "synthetic":
@@ -157,7 +190,7 @@ def build_engine(path: str | Path, live: bool = False) -> Engine:
         raise ConfigError("no [venues] configured")
 
     fees = {n: ex.taker_fee for n, ex in exchanges.items()}
-    strategies = [_build_strategy(s, fees, exchanges) for s in cfg.get("strategies", [])]
+    strategies = [_build_strategy(s, fees, exchanges, calendars) for s in cfg.get("strategies", [])]
     if not strategies:
         raise ConfigError("no [[strategies]] configured")
 
@@ -165,7 +198,7 @@ def build_engine(path: str | Path, live: bool = False) -> Engine:
     limits = RiskLimits(
         **{k: Decimal(str(v)) if isinstance(getattr(RiskLimits, k, None), Decimal) else v for k, v in r.items()}
     )
-    risk = RiskManager(limits, assets_of=lambda v, s: exchanges[v].assets(s))
+    risk = RiskManager(limits, assets_of=lambda v, s: exchanges[v].assets(s), calendars=calendars)
     return Engine(
         exchanges,
         strategies,

@@ -1,7 +1,8 @@
 """Pre-trade risk checks and circuit breakers.
 
-Every TradePlan passes through `check` before any order is sent. The manager
-halts all trading (until restarted) when the daily loss limit is hit, when the
+Every TradePlan passes through `check` before any order is sent. Orders on a
+venue with a market calendar (US equities) are refused outside its session,
+whatever the strategy thinks. The manager halts all trading (until restarted) when the daily loss limit is hit, when the
 kill-switch file appears, or when the engine reports an unrecoverable leg.
 """
 
@@ -15,6 +16,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
+from ..market_hours import MarketCalendar
 from ..models import ZERO, MarketSnapshot, Side, TradePlan
 from .portfolio import AssetsOf
 
@@ -33,8 +35,15 @@ class RiskLimits:
 
 
 class RiskManager:
-    def __init__(self, limits: RiskLimits, assets_of: AssetsOf, clock=time.time):
+    def __init__(
+        self,
+        limits: RiskLimits,
+        assets_of: AssetsOf,
+        clock=time.time,
+        calendars: dict[str, MarketCalendar] | None = None,
+    ):
         self.limits = limits
+        self.calendars = calendars or {}  # venue -> trading hours; absent = 24/7
         self.assets_of = assets_of
         self.clock = clock
         self.halted = False
@@ -85,6 +94,9 @@ class RiskManager:
             return f"expected profit {plan.expected_profit:.4f} below minimum"
 
         for leg in plan.legs:
+            cal = self.calendars.get(leg.venue)
+            if cal is not None and not cal.is_open(now):
+                return f"{leg.venue} market closed"
             book = snap.book(leg.venue, leg.symbol)
             if book is None:
                 return f"no book for {leg.venue}:{leg.symbol}"

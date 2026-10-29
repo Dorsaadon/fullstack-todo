@@ -48,8 +48,14 @@ secret_env = "KRAKEN_API_SECRET"
 paper_balances = { USDT = 5000, BTC = 0.05 }
 
 # --- US equities ------------------------------------------------------------
+# Optional: closures the calendar can't predict (national days of mourning...).
+[market_calendar]
+extra_holidays = []            # e.g. ["2025-01-09"]
+extra_early_closes = []
+
 [venues.alpaca]
 kind = "alpaca"
+market_hours = "us_equities"   # orders refused outside regular hours (the default for alpaca)
 paper_account = true           # Alpaca's own paper account; false = real money
 feed = "iex"                   # "sip" needs a paid data plan
 api_key_env = "ALPACA_API_KEY"
@@ -91,6 +97,22 @@ venue = "polymarket"
 outcomes = ["<YES_TOKEN_ID>", "<NO_TOKEN_ID>"]
 min_edge_bps = 50
 max_size = 50
+
+[[strategies]]
+kind = "opening_range_breakout"
+name = "orb"
+venue = "alpaca"
+symbols = ["SPY", "QQQ", "NVDA"]
+range_minutes = 15
+entry_cutoff_minutes = 120     # no new entries after 11:30 ET
+flatten_minutes_before_close = 5
+breakout_buffer_bps = 5
+min_range_bps = 20             # skip dead-flat opens
+max_range_bps = 300            # skip opens too wild to size sensibly
+risk_per_trade = 25            # USD lost if the stop is hit
+max_position_notional = 2000
+take_profit_r = 2              # 0 = hold until the flatten time
+max_slippage_bps = 10
 
 [[strategies]]
 kind = "mean_reversion"

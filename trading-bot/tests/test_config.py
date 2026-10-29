@@ -10,9 +10,9 @@ DEMO = Path(__file__).parent.parent / "config" / "demo.toml"
 
 def test_demo_config_builds_and_runs(no_kill_file):
     engine = build_engine(DEMO)
-    assert len(engine.strategies) == 5
+    assert len(engine.strategies) == 6
     snap = asyncio.run(engine.snapshot())
-    assert len(snap.books) == 10
+    assert len(snap.books) == 12
     asyncio.run(engine.tick())
 
 

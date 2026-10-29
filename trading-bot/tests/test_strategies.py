@@ -1,4 +1,4 @@
-from tradebot.models import MarketSnapshot, Side
+from tradebot.models import MarketSnapshot, Order, OrderStatus, Side
 from tradebot.strategies import CrossExchangeArbitrage, MeanReversion, PredictionMarketArbitrage, TriangularArbitrage
 
 from conftest import D, book
@@ -88,6 +88,8 @@ def test_mean_reversion_enters_and_exits():
         plans = st.on_snapshot(snap([b], {"alp": {"USD": D(10_000)}}))
     [entry] = plans
     assert entry.legs[0].side is Side.BUY and entry.legs[0].size == D(2)
+    st.on_orders(entry, [Order(entry.legs[0], "1", OrderStatus.FILLED, filled=D(2), avg_price=D(97))])
     b = book("alp", "AAPL", [(101, 100)], [(101.02, 100)], ts=10.0)
-    [exit_] = st.on_snapshot(snap([b], {"alp": {"USD": D(9_800), "AAPL": D(2)}}))
+    # The account holds 50 more AAPL that the strategy didn't buy; it sells only its 2.
+    [exit_] = st.on_snapshot(snap([b], {"alp": {"USD": D(9_800), "AAPL": D(52)}}))
     assert exit_.legs[0].side is Side.SELL and exit_.legs[0].size == D(2)

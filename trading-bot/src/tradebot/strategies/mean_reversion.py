@@ -4,6 +4,9 @@ Buys when price is `entry_z` standard deviations below its rolling mean and
 exits when it reverts to within `exit_z`. Long only, one position at a time.
 Unlike the arbitrage strategies this takes market risk; backtest before use.
 
+It only sells shares it bought itself, so other holdings in the same account
+are never touched.
+
 Prices are sampled at most once per `sample_interval_s`, so `window` means
 the same span of time whether quotes stream 50 times a second or are polled.
 """
@@ -15,7 +18,7 @@ from collections import deque
 from collections.abc import Mapping
 from decimal import Decimal
 
-from ..models import ZERO, MarketSnapshot, OrderRequest, Side, TradePlan
+from ..models import ZERO, MarketSnapshot, Order, OrderRequest, Side, TradePlan
 from .base import Strategy
 
 
@@ -40,6 +43,7 @@ class MeanReversion(Strategy):
         self.exit_z = exit_z
         self.order_size = order_size
         self.sample_interval_s = sample_interval_s
+        self.shares = ZERO  # held by this strategy
         self.mids: deque[float] = deque(maxlen=window)
         self._last_ts: float | None = None
 
@@ -63,11 +67,18 @@ class MeanReversion(Strategy):
         if z is None:
             return []
 
-        position = snap.balance(self.venue, self.symbol)
-        if position == ZERO and z <= -self.entry_z and book.best_ask:
+        position = min(self.shares, snap.balance(self.venue, self.symbol))
+        if self.shares == ZERO and z <= -self.entry_z and book.best_ask:
             leg = OrderRequest(self.venue, self.symbol, Side.BUY, self.order_size, book.best_ask.price, strategy=self.name)
             return [TradePlan(self.name, (leg,), atomic=False, reason=f"entry z={z:.2f}")]
         if position > ZERO and z >= -self.exit_z and book.best_bid:
             leg = OrderRequest(self.venue, self.symbol, Side.SELL, position, book.best_bid.price, strategy=self.name)
             return [TradePlan(self.name, (leg,), atomic=False, reason=f"exit z={z:.2f}")]
         return []
+
+    def on_orders(self, plan: TradePlan, orders: list[Order]) -> None:
+        for o in orders:
+            if o.request.side is Side.BUY:
+                self.shares += o.filled
+            else:
+                self.shares = max(self.shares - o.filled, ZERO)
