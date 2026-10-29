@@ -1,12 +1,15 @@
 """Crypto exchanges via ccxt: Binance, Binance.US, Coinbase, Kraken, OKX, Bybit...
 
 One adapter covers 100+ venues; `exchange_id` picks which. US residents must use
-"binanceus" rather than "binance".
+"binanceus" rather than "binance". Venues supported by ccxt.pro (bundled with
+ccxt) stream order books over WebSockets; the rest fall back to REST polling.
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
+from collections.abc import AsyncIterator
 from decimal import Decimal
 
 from ..models import Order, OrderBook, OrderRequest, OrderStatus, OrderType
@@ -35,10 +38,14 @@ class CcxtExchange(Exchange):
     ):
         super().__init__(name, taker_fee, quote_currency)
         import ccxt.async_support as ccxt  # optional dependency
+        import ccxt.pro as ccxtpro
 
         self._errors = ccxt.BaseError
+        # ccxt.pro classes extend the async REST ones, so one client does both.
+        self.streaming = exchange_id in ccxtpro.exchanges
+        module = ccxtpro if self.streaming else ccxt
         creds = {k: v for k, v in {"apiKey": api_key, "secret": secret, "password": password}.items() if v}
-        self.client = getattr(ccxt, exchange_id)({**creds, "enableRateLimit": True})
+        self.client = getattr(module, exchange_id)({**creds, "enableRateLimit": True})
         if sandbox:
             self.client.set_sandbox_mode(True)
 
@@ -49,11 +56,46 @@ class CcxtExchange(Exchange):
         await self.client.close()
 
     async def fetch_order_book(self, symbol: str, depth: int = 10) -> OrderBook:
-        ob = await self.client.fetch_order_book(symbol, limit=depth)
+        return self._to_book(symbol, await self.client.fetch_order_book(symbol, limit=depth), depth)
+
+    def _to_book(self, symbol: str, ob: dict, depth: int) -> OrderBook:
         ts = ob["timestamp"] / 1000 if ob.get("timestamp") else time.time()
         return OrderBook.from_raw(
-            self.name, symbol, [lv[:2] for lv in ob["bids"]], [lv[:2] for lv in ob["asks"]], ts
+            self.name, symbol, [lv[:2] for lv in ob["bids"][:depth]], [lv[:2] for lv in ob["asks"][:depth]], ts
         )
+
+    async def watch_order_books(self, symbols: list[str], depth: int = 10) -> AsyncIterator[OrderBook | None]:
+        if not self.streaming:
+            async for item in super().watch_order_books(symbols, depth):
+                yield item
+            return
+        # ccxt.pro multiplexes symbols over its own connections; we run one
+        # watcher per symbol and merge them. Any watcher's error ends the
+        # stream so the hub reconnects the venue.
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def watch(symbol: str) -> None:
+            try:
+                while True:
+                    # No limit: some venues only accept specific WS depths. We trim instead.
+                    ob = await self.client.watch_order_book(symbol)
+                    await queue.put(self._to_book(symbol, ob, depth))
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                await queue.put(e)
+
+        tasks = [asyncio.create_task(watch(s)) for s in symbols]
+        try:
+            while True:
+                item = await queue.get()
+                if isinstance(item, Exception):
+                    raise item
+                yield item
+        finally:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def fetch_balances(self) -> dict[str, Decimal]:
         bal = await self.client.fetch_balance()

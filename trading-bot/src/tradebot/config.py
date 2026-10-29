@@ -82,7 +82,7 @@ def _build_live_adapter(name: str, cfg: dict, live: bool, synthetic_market) -> E
         # Alpaca needs keys even for market data; a paper-account key is fine.
         return AlpacaExchange(
             name, _env(cfg, "api_key_env", True), _env(cfg, "secret_env", True),
-            paper=cfg.get("paper_account", True), feed=cfg.get("feed", "iex"),
+            paper=cfg.get("paper_account", True), feed=cfg.get("feed", "iex"), stream_url=cfg.get("stream_url"),
         )
     if kind == "polymarket":
         from .exchanges.polymarket import PolymarketExchange
@@ -93,6 +93,7 @@ def _build_live_adapter(name: str, cfg: dict, live: bool, synthetic_market) -> E
             funder=_env(cfg, "funder_env", False),
             signature_type=cfg.get("signature_type"),
             taker_fee=fee,
+            **({"ws_url": cfg["ws_url"]} if "ws_url" in cfg else {}),
         )
     raise ConfigError(f"venue {name}: unknown kind {kind!r}")
 
@@ -173,4 +174,9 @@ def build_engine(path: str | Path, live: bool = False) -> Engine:
         poll_interval_s=eng_cfg.get("poll_interval_s", 2.0),
         book_depth=eng_cfg.get("book_depth", 10),
         unwind_slippage_bps=Decimal(str(eng_cfg.get("unwind_slippage_bps", 50))),
+        data_mode=eng_cfg.get("data_mode", "stream"),
+        heartbeat_s=eng_cfg.get("heartbeat_s", 1.0),
+        min_tick_interval_s=eng_cfg.get("min_tick_interval_s", 0.05),
+        balance_refresh_s=eng_cfg.get("balance_refresh_s", 30.0),
+        warmup_timeout_s=eng_cfg.get("warmup_timeout_s", 15.0),
     )

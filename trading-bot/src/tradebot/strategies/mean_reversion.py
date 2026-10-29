@@ -3,6 +3,9 @@
 Buys when price is `entry_z` standard deviations below its rolling mean and
 exits when it reverts to within `exit_z`. Long only, one position at a time.
 Unlike the arbitrage strategies this takes market risk; backtest before use.
+
+Prices are sampled at most once per `sample_interval_s`, so `window` means
+the same span of time whether quotes stream 50 times a second or are polled.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ class MeanReversion(Strategy):
         entry_z: float = 2.0,
         exit_z: float = 0.0,
         order_size: Decimal = Decimal("1"),
+        sample_interval_s: float = 1.0,
     ):
         super().__init__(name, fees)
         self.venue = venue
@@ -35,6 +39,7 @@ class MeanReversion(Strategy):
         self.entry_z = entry_z
         self.exit_z = exit_z
         self.order_size = order_size
+        self.sample_interval_s = sample_interval_s
         self.mids: deque[float] = deque(maxlen=window)
         self._last_ts: float | None = None
 
@@ -51,7 +56,7 @@ class MeanReversion(Strategy):
         book = snap.book(self.venue, self.symbol)
         if not book or book.mid is None:
             return []
-        if book.ts != self._last_ts:  # only sample new quotes, not repeated polls
+        if self._last_ts is None or book.ts - self._last_ts >= self.sample_interval_s:
             self._last_ts = book.ts
             self.mids.append(float(book.mid))
         z = self.zscore()

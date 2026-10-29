@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import uuid
 from collections import defaultdict
+from collections.abc import AsyncIterator
 from decimal import Decimal
 
 from ..models import ZERO, Order, OrderBook, OrderRequest, OrderStatus, Side, TimeInForce
@@ -50,6 +51,21 @@ class PaperExchange(Exchange):
         if symbol not in self._books:
             raise KeyError(f"{self.name}: no order book for {symbol}")
         return self._books[symbol]
+
+    async def watch_order_books(self, symbols: list[str], depth: int = 10) -> AsyncIterator[OrderBook | None]:
+        if self.data_source is None:
+            async for item in super().watch_order_books(symbols, depth):
+                yield item
+            return
+        self.data_source.poll_interval_s = self.poll_interval_s
+        async for book in self.data_source.watch_order_books(symbols, depth):
+            if book is None:
+                yield None
+                continue
+            # Streamed books drive simulated fills, exactly like fetched ones.
+            mine = OrderBook(self.name, book.symbol, book.bids, book.asks, book.ts)
+            self._books[book.symbol] = mine
+            yield mine
 
     async def fetch_balances(self) -> dict[str, Decimal]:
         return {k: v for k, v in self.balances.items() if v != 0}

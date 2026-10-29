@@ -3,6 +3,7 @@
 
 [engine]
 mode = "paper"
+data_mode = "stream"        # synthetic venues push a new book every market step
 poll_interval_s = 0.5
 journal = "data/demo-journal.jsonl"
 

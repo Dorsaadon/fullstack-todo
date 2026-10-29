@@ -3,23 +3,35 @@
 Stocks only expose top-of-book (NBBO) through this feed, so books have a single
 level per side. The free "iex" feed covers one exchange; "sip" is the full
 consolidated tape and needs a paid data plan.
+
+Streaming speaks Alpaca's market-data WebSocket protocol directly (alpaca-py's
+StockDataStream runs its own event loop). Alpaca caps concurrent data
+connections per account (one on the free plan), so all symbols share one.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import time
+from collections.abc import AsyncIterator
 from decimal import Decimal
 
 from ..models import Order, OrderBook, OrderRequest, OrderStatus, OrderType, Side, TimeInForce
 from .base import Exchange
 
 _TERMINAL = {"filled", "canceled", "expired", "rejected", "done_for_day"}
+STREAM_URL = "wss://stream.data.alpaca.markets/v2/{feed}"
+IDLE_HEARTBEAT_S = 5.0  # quiet this long on an open socket => report "alive"
 
 
 class AlpacaExchange(Exchange):
-    def __init__(self, name: str, api_key: str, secret: str, paper: bool = True, feed: str = "iex"):
+    def __init__(
+        self, name: str, api_key: str, secret: str, paper: bool = True, feed: str = "iex", stream_url: str | None = None
+    ):
         super().__init__(name, Decimal("0"), "USD")
+        self._key, self._secret = api_key, secret
+        self.stream_url = stream_url or STREAM_URL.format(feed=feed)
         from alpaca.data.enums import DataFeed
         from alpaca.data.historical import StockHistoricalDataClient
         from alpaca.trading.client import TradingClient
@@ -36,6 +48,41 @@ class AlpacaExchange(Exchange):
         return OrderBook.from_raw(
             self.name, symbol, [(q.bid_price, q.bid_size)], [(q.ask_price, q.ask_size)], q.timestamp.timestamp()
         )
+
+    async def watch_order_books(self, symbols: list[str], depth: int = 10) -> AsyncIterator[OrderBook | None]:
+        import websockets
+
+        # websockets pings every 10s and drops the socket if pongs stop, so an
+        # idle-but-open connection is genuinely alive.
+        async with websockets.connect(self.stream_url, ping_interval=10, ping_timeout=10) as ws:
+            await self._expect(ws, "connected")
+            await ws.send(json.dumps({"action": "auth", "key": self._key, "secret": self._secret}))
+            await self._expect(ws, "authenticated")
+            await ws.send(json.dumps({"action": "subscribe", "quotes": symbols}))
+            while True:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), IDLE_HEARTBEAT_S)
+                except asyncio.TimeoutError:
+                    yield None
+                    continue
+                for msg in json.loads(raw):
+                    kind = msg.get("T")
+                    if kind == "q":
+                        yield OrderBook.from_raw(
+                            self.name, msg["S"], [(msg["bp"], msg["bs"])], [(msg["ap"], msg["as"])]
+                        )
+                    elif kind == "subscription":
+                        yield None
+                    elif kind == "error":
+                        raise ConnectionError(f"alpaca stream error {msg.get('code')}: {msg.get('msg')}")
+
+    @staticmethod
+    async def _expect(ws, what: str) -> None:
+        msg = json.loads(await asyncio.wait_for(ws.recv(), 10))[0]
+        if msg.get("T") == "error":
+            raise ConnectionError(f"alpaca stream error {msg.get('code')}: {msg.get('msg')}")
+        if msg.get("T") != "success" or msg.get("msg") != what:
+            raise ConnectionError(f"alpaca stream: expected {what!r}, got {msg}")
 
     async def fetch_balances(self) -> dict[str, Decimal]:
         account = await asyncio.to_thread(self.trading.get_account)

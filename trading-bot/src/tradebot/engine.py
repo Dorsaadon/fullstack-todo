@@ -1,13 +1,22 @@
-"""The trading loop: snapshot -> strategies -> risk -> execution -> repeat."""
+"""The trading loop: snapshot -> strategies -> risk -> execution -> repeat.
+
+Two data modes:
+  * "stream" (default): a MarketDataHub pushes book updates and the engine
+    reacts within milliseconds, running only strategies whose books changed.
+  * "poll": fetch every book and balance over REST every `poll_interval_s`.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import time
 from decimal import Decimal
 
 from .exchanges.base import Exchange
 from .journal import Journal
+from .marketdata import MarketDataHub
 from .models import MarketSnapshot, Order, OrderRequest, OrderStatus, Side, TimeInForce, TradePlan
 from .risk import RiskManager, equity, usd_prices
 from .strategies.base import Strategy
@@ -31,7 +40,14 @@ class Engine:
         poll_interval_s: float = 2.0,
         book_depth: int = 10,
         unwind_slippage_bps: Decimal = Decimal("50"),
+        data_mode: str = "stream",
+        heartbeat_s: float = 1.0,
+        min_tick_interval_s: float = 0.05,
+        balance_refresh_s: float = 30.0,
+        warmup_timeout_s: float = 15.0,
     ):
+        if data_mode not in ("stream", "poll"):
+            raise ValueError("data_mode must be 'stream' or 'poll'")
         self.exchanges = exchanges
         self.strategies = strategies
         self.risk = risk
@@ -39,7 +55,17 @@ class Engine:
         self.poll_interval_s = poll_interval_s
         self.book_depth = book_depth
         self.unwind_slippage = unwind_slippage_bps / Decimal("10000")
+        self.data_mode = data_mode
+        self.heartbeat_s = heartbeat_s  # re-check risk/equity at least this often
+        self.min_tick_interval_s = min_tick_interval_s  # coalesce bursts of updates
+        self.balance_refresh_s = balance_refresh_s
+        self.warmup_timeout_s = warmup_timeout_s
+        self.hub = MarketDataHub(exchanges, book_depth) if data_mode == "stream" else None
+        self._balances: dict[str, dict[str, Decimal]] = {}
+        self._last_rejection: dict[str, str] = {}
         self._stop = asyncio.Event()
+        for ex in exchanges.values():
+            ex.poll_interval_s = poll_interval_s  # cadence for venues without WebSockets
         for s in strategies:
             for venue, _ in s.subscriptions():
                 if venue not in exchanges:
@@ -56,8 +82,62 @@ class Engine:
 
     def stop(self) -> None:
         self._stop.set()
+        if self.hub:
+            self.hub.wake()
+
+    def subscriptions(self) -> list[tuple[str, str]]:
+        return sorted({sub for s in self.strategies for sub in s.subscriptions()})
 
     async def run(self, max_ticks: int | None = None) -> None:
+        if self.hub:
+            await self._run_streaming(max_ticks)
+        else:
+            await self._run_polling(max_ticks)
+
+    async def _run_streaming(self, max_ticks: int | None) -> None:
+        subs = self.subscriptions()
+        await self.hub.start(subs)
+        # Don't value the account (or set the daily-loss baseline) until every
+        # book has arrived; a partial first valuation would hide later losses.
+        missing = await self.hub.warm_up(subs, self.warmup_timeout_s)
+        if missing:
+            log.warning("no data yet for %s; strategies using them wait", sorted(missing))
+        await self._refresh_balances(list(self.exchanges))
+        last_balance_refresh = time.monotonic()
+        ticks = 0
+        try:
+            while not self._stop.is_set() and (max_ticks is None or ticks < max_ticks):
+                changed = await self.hub.wait(self.heartbeat_s)
+                if self._stop.is_set():
+                    break
+                if changed and self.min_tick_interval_s:
+                    await asyncio.sleep(self.min_tick_interval_s)  # let a burst settle
+                dirty = self.hub.take_dirty()
+                if time.monotonic() - last_balance_refresh > self.balance_refresh_s:
+                    await self._refresh_balances(list(self.exchanges))
+                    last_balance_refresh = time.monotonic()
+                try:
+                    await self.tick(self.stream_snapshot(), only=dirty)
+                except Exception:
+                    log.exception("tick failed")
+                ticks += 1
+        finally:
+            await self.hub.stop()
+
+    def stream_snapshot(self) -> MarketSnapshot:
+        # Balances are shared, not copied, so post-trade refreshes update the cache.
+        return MarketSnapshot(dict(self.hub.books), self._balances, alive=dict(self.hub.alive))
+
+    async def _refresh_balances(self, venues: list[str]) -> None:
+        results = await asyncio.gather(*(self.exchanges[v].fetch_balances() for v in venues), return_exceptions=True)
+        for v, res in zip(venues, results):
+            if isinstance(res, BaseException):
+                log.warning("balances %s unavailable: %s", v, res)
+                self._balances.setdefault(v, {})
+            else:
+                self._balances[v] = res
+
+    async def _run_polling(self, max_ticks: int | None) -> None:
         ticks = 0
         while not self._stop.is_set() and (max_ticks is None or ticks < max_ticks):
             try:
@@ -71,7 +151,7 @@ class Engine:
                 pass
 
     async def snapshot(self) -> MarketSnapshot:
-        subs = sorted({sub for s in self.strategies for sub in s.subscriptions()})
+        subs = self.subscriptions()
         venues = list(self.exchanges)
         results = await asyncio.gather(
             *(self.exchanges[v].fetch_order_book(sym, self.book_depth) for v, sym in subs),
@@ -90,8 +170,11 @@ class Engine:
             balances[v] = {} if isinstance(res, BaseException) else res
         return MarketSnapshot(books, balances)
 
-    async def tick(self) -> list[tuple[TradePlan, list[Order]]]:
-        snap = await self.snapshot()
+    async def tick(
+        self, snap: MarketSnapshot | None = None, only: set[tuple[str, str]] | None = None
+    ) -> list[tuple[TradePlan, list[Order]]]:
+        """Evaluate strategies once. `only` limits it to strategies watching those books."""
+        snap = snap if snap is not None else await self.snapshot()
         prices = usd_prices(snap, self.assets_of)
         eq, unpriced = equity(snap, prices)
         if unpriced:
@@ -100,6 +183,8 @@ class Engine:
 
         executed = []
         for strat in self.strategies:
+            if only is not None and not only.intersection(strat.subscriptions()):
+                continue
             try:
                 plans = strat.on_snapshot(snap)
             except Exception:
@@ -108,9 +193,14 @@ class Engine:
             for plan in plans:
                 reason = self.risk.check(plan, snap, prices)
                 if reason:
-                    log.info("[%s] rejected: %s", strat.name, reason)
-                    self.journal.write("rejected", strategy=strat.name, reason=reason, plan=plan)
+                    # Streaming re-evaluates constantly; only report a reason when it changes.
+                    key = re.sub(r"[-+]?\d[\d.,]*", "#", reason)  # ignore changing numbers
+                    if self._last_rejection.get(strat.name) != key:
+                        log.info("[%s] rejected: %s", strat.name, reason)
+                        self.journal.write("rejected", strategy=strat.name, reason=reason, plan=plan)
+                    self._last_rejection[strat.name] = key
                     continue
+                self._last_rejection.pop(strat.name, None)
                 orders = await self.execute(plan)
                 strat.on_orders(plan, orders)
                 executed.append((plan, orders))

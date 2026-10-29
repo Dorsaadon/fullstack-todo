@@ -11,10 +11,10 @@ dependencies = []
 
 [project.optional-dependencies]
 crypto = ["ccxt>=4.4"]
-stocks = ["alpaca-py>=0.40"]
-polymarket = ["py-clob-client>=0.34"]
-all = ["ccxt>=4.4", "alpaca-py>=0.40", "py-clob-client>=0.34"]
-dev = ["pytest>=8"]
+stocks = ["alpaca-py>=0.40", "websockets>=13"]
+polymarket = ["py-clob-client>=0.34", "websockets>=13"]
+all = ["ccxt>=4.4", "alpaca-py>=0.40", "py-clob-client>=0.34", "websockets>=13"]
+dev = ["pytest>=8", "websockets>=13"]
 
 [project.scripts]
 tradebot = "tradebot.cli:main"

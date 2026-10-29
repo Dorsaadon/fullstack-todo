@@ -78,7 +78,7 @@ class OrderBook:
         """Build a book from any iterable of (price, size) pairs, in any order."""
         def levels(raw, reverse: bool) -> tuple[Level, ...]:
             parsed = [Level(Decimal(str(p)), Decimal(str(s))) for p, s in raw]
-            parsed = [lv for lv in parsed if lv.size > 0]
+            parsed = [lv for lv in parsed if lv.size > 0 and lv.price > 0]
             return tuple(sorted(parsed, key=lambda lv: lv.price, reverse=reverse))
 
         return cls(venue, symbol, levels(bids, True), levels(asks, False), ts if ts is not None else time.time())
@@ -205,6 +205,15 @@ class MarketSnapshot:
     books: dict[tuple[str, str], OrderBook]
     balances: dict[str, dict[str, Decimal]]  # venue -> asset -> free amount
     ts: float = field(default_factory=time.time)
+    # Streaming only: when each feed last proved alive. A quiet market's book
+    # can be old yet still current while its connection is healthy.
+    alive: dict[tuple[str, str], float] = field(default_factory=dict)
+
+    def data_age(self, venue: str, symbol: str, now: float | None = None) -> float:
+        now = now if now is not None else time.time()
+        book = self.books.get((venue, symbol))
+        last = max(book.ts if book else 0.0, self.alive.get((venue, symbol), 0.0))
+        return now - last
 
     def book(self, venue: str, symbol: str) -> OrderBook | None:
         return self.books.get((venue, symbol))

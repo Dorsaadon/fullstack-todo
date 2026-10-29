@@ -8,7 +8,11 @@
 
 [engine]
 mode = "paper"
-poll_interval_s = 2
+data_mode = "stream"           # WebSockets where the venue has them; "poll" = REST only
+heartbeat_s = 1                # re-check equity and risk at least this often
+min_tick_interval_s = 0.05     # coalesce bursts of updates before running strategies
+balance_refresh_s = 30         # balances also refresh after every trade
+poll_interval_s = 2            # REST cadence for venues without WebSockets
 book_depth = 10
 journal = "data/journal.jsonl"
 unwind_slippage_bps = 50
@@ -93,7 +97,8 @@ kind = "mean_reversion"
 name = "spy-meanrev"
 venue = "alpaca"
 symbol = "SPY"
-window = 60
+window = 60                    # samples, one per sample_interval_s
+sample_interval_s = 1
 entry_z = 2.0
 exit_z = 0.0
 order_size = 1

@@ -88,8 +88,9 @@ class RiskManager:
             book = snap.book(leg.venue, leg.symbol)
             if book is None:
                 return f"no book for {leg.venue}:{leg.symbol}"
-            if book.age(now) > self.limits.max_book_age_s:
-                return f"stale book {leg.venue}:{leg.symbol} ({book.age(now):.1f}s old)"
+            age = snap.data_age(leg.venue, leg.symbol, now)
+            if age > self.limits.max_book_age_s:
+                return f"stale book {leg.venue}:{leg.symbol} ({age:.1f}s old)"
             base, quote = self.assets_of(leg.venue, leg.symbol)
             if quote not in prices:
                 return f"cannot value {quote}"

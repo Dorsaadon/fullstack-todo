@@ -9,10 +9,12 @@ so triangular cycles stay mostly consistent.
 
 from __future__ import annotations
 
+import asyncio
 import math
 import random
 import time
 import zlib
+from collections.abc import AsyncIterator
 from decimal import Decimal
 
 from ..models import STABLE_ASSETS, Order, OrderBook, OrderRequest
@@ -115,6 +117,15 @@ class SyntheticExchange(Exchange):
         asks = [(px(mid + half + i * step_px), Decimal(f"{size_unit * rng.uniform(0.5, 1.5):.6g}")) for i in range(self.levels)]
         book = OrderBook.from_raw(self.name, symbol, bids, asks)
         return OrderBook(self.name, symbol, book.bids[:depth], book.asks[:depth], book.ts)
+
+    async def watch_order_books(self, symbols: list[str], depth: int = 10) -> AsyncIterator[OrderBook | None]:
+        """Push a fresh book for every symbol each time the market steps."""
+        while True:
+            for s in symbols:
+                yield await self.fetch_order_book(s, depth)
+            m = self.market
+            next_step = m.t0 + (m.step + 1) * m.step_s
+            await asyncio.sleep(max(next_step - m.clock(), 0.001))
 
     async def place_order(self, req: OrderRequest) -> Order:
         raise NotImplementedError("synthetic venues are data-only; run them in paper mode")
