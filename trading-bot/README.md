@@ -110,9 +110,10 @@ arbitrage** (spot vs perpetual on crypto).
 - **Prediction markets** are where retail-scale arbitrage is most realistic
   today. Mispricings are larger and slower, especially in multi-outcome and
   low-volume markets.
-- **Stocks via Alpaca** give you top-of-book only and pattern-day-trader rules
-  (you need $25k equity to day-trade a margin account). Statistical strategies
-  fit better than pure arbitrage here.
+- **Stocks via Alpaca** give you top-of-book only. Statistical strategies fit
+  better than pure arbitrage here. The $25k pattern-day-trader minimum was
+  replaced by intraday margin rules (FINRA Rule 4210, effective June 2026), but
+  brokers phase this in and can set their own minimums, so check yours.
 - **Arbitrage profit is not the same as account P&L.** Pre-funded inventory
   (BTC sitting on both venues) moves with the market. In the demo the arbs earn
   about +$75, yet the account can still finish down because the coins it holds
