@@ -16,7 +16,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[all,dev]"
 
 python -m tradebot run -c config/demo.toml --ticks 150  # offline, no keys
-pytest                                                  # 66 tests
+pytest                                                  # 74 tests
 ```
 
 ## Architecture
@@ -41,6 +41,8 @@ pytest                                                  # 66 tests
 | Market hours | `market_hours.py` | NYSE sessions, holidays and early closes, computed from the exchange's rules. |
 | Market data | `marketdata.py` | One stream per venue. Keeps the latest books, reconnects with backoff, tracks feed health. |
 | Engine | `engine.py` | Event-driven loop. Fires a plan's legs concurrently and **unwinds uneven fills** (legging risk). |
+| Recording | `recording.py` | Writes every book update to daily gzip files; reads them back. |
+| Backtest | `backtest.py` | Replays recordings through the real engine on a simulated clock, with a latency model. |
 | Config | `config.py`, `config/*.toml` | Everything is declared in TOML. Secrets come from env vars. |
 
 ## Streaming market data
@@ -70,6 +72,46 @@ How it stays safe:
 
 `data_mode = "poll"` keeps the original REST loop. `tradebot check` always
 uses REST.
+
+## Recording and backtesting
+
+```bash
+python -m tradebot record   -c config/local.toml                   # collect data, no trading
+python -m tradebot backtest -c config/local.toml --latency-ms 100   # replay it through the strategies
+python -m tradebot backtest -c config/local.toml --start 2026-10-01 --end 2026-10-28
+```
+
+**Recording** writes every order-book update the bot receives to
+`data/recordings/YYYY-MM-DD.jsonl.gz`, plus once-a-second "feed alive"
+heartbeats so quiet books replay correctly. Compression runs off the event
+loop, so it never slows trading. A crash loses at most the last 5 seconds,
+and earlier data stays readable. Set `[recording] enabled = true` to record
+while the bot trades, or run `tradebot record` to only collect data.
+Roughly: one liquid crypto pair at 10 levels is tens of MB per day
+compressed. Use `min_interval_s` to downsample.
+
+**Backtesting** replays the recording through the *same* engine, strategies
+and risk manager that trade live. Only the clock is simulated and the venues
+are paper. No network, API keys or venue SDKs are needed. Updates are grouped
+into ticks the way the live loop groups them, market hours and daily loss
+limits follow simulated time, and the warm-up rule applies.
+
+**Latency** is the setting that matters most: `--latency-ms 100` (the
+default) fills each order against the book as it was 100ms after the
+decision. With `--latency-ms 0`, orders fill against the very book that
+triggered them, which flatters everything. The test suite has a fleeting
+arbitrage that makes +$2 with instant fills and loses $1 to an unwind at
+100ms. Run your strategies at a realistic latency for your setup (50–300ms
+from a home connection) before believing any number.
+
+The report shows P&L, max drawdown, annualized Sharpe ratio (from daily P&L),
+fees and borrow costs, plans and fills per strategy, and daily P&L. It's saved
+with `trades.csv` and `equity.csv` to `data/backtests/<timestamp>/`.
+
+**Still not modelled:** queue position and market impact. Your orders never
+move recorded prices, so results for size that is large relative to the book
+are optimistic. Recordings also only contain what the bot subscribed to, so
+add symbols to the config *before* recording the data you want.
 
 ## Strategies
 
@@ -175,9 +217,9 @@ opened themselves, so they never touch other holdings in the same account.
    That finding is useful, not a failure.
 
 ### Phase 3: Build the things paper trading can't tell you
-- **Record and replay data.** Log books to disk, then replay them through
-  `PaperExchange.set_order_book` for repeatable backtests. Paper fills ignore
-  queue position and latency, so treat paper P&L as an upper bound.
+- **Record weeks of data and backtest** (`tradebot record`, `tradebot backtest`).
+  Tune parameters on one period and confirm on a different one; parameters
+  tuned and judged on the same data look better than they are.
 - **Stream your own fills and orders** (user-data WebSockets) instead of
   checking order state over REST after each submit.
 - **Inventory rebalancing** for cross-exchange arbitrage, since it piles up

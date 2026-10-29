@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import os
+import time
 import tomllib
 from decimal import Decimal
 from pathlib import Path
@@ -13,6 +15,7 @@ from .exchanges.base import Exchange
 from .exchanges.paper import PaperExchange
 from .journal import Journal
 from .market_hours import MarketCalendar, RollingSessionCalendar
+from .recording import Recorder
 from .risk import RiskLimits, RiskManager
 from .strategies import (
     CrossExchangeArbitrage,
@@ -29,6 +32,8 @@ STRATEGIES = {
     "mean_reversion": MeanReversion,
     "opening_range_breakout": OpeningRangeBreakout,
 }
+
+DEFAULT_QUOTE = {"ccxt": "USDT", "alpaca": "USD", "polymarket": "USDC"}
 
 VENUE_ONLY_KEYS = (
     "kind", "taker_fee", "paper_balances", "market_hours", "demo_session_minutes", "demo_gap_minutes",
@@ -111,15 +116,15 @@ def _build_live_adapter(name: str, cfg: dict, live: bool, synthetic_market) -> E
     raise ConfigError(f"venue {name}: unknown kind {kind!r}")
 
 
-def _build_calendar(name: str, vcfg: dict, global_cfg: dict) -> MarketCalendar | None:
+def _build_calendar(name: str, vcfg: dict, global_cfg: dict, clock=time.time) -> MarketCalendar | None:
     """Trading hours for a venue. Alpaca defaults to US equities; others are 24/7."""
     hours = vcfg.get("market_hours", "us_equities" if vcfg.get("kind") == "alpaca" else None)
     if hours is None:
         return None
     if hours == "us_equities":
-        return MarketCalendar(global_cfg.get("extra_holidays", ()), global_cfg.get("extra_early_closes", ()))
+        return MarketCalendar(global_cfg.get("extra_holidays", ()), global_cfg.get("extra_early_closes", ()), clock)
     if hours == "demo":
-        return RollingSessionCalendar(vcfg.get("demo_session_minutes", 5.0), vcfg.get("demo_gap_minutes", 0.0))
+        return RollingSessionCalendar(vcfg.get("demo_session_minutes", 5.0), vcfg.get("demo_gap_minutes", 0.0), clock)
     raise ConfigError(f"venue {name}: market_hours must be 'us_equities' or 'demo'")
 
 
@@ -149,8 +154,17 @@ def _build_strategy(
     return cls(fees=fees, **cfg)
 
 
-def build_engine(path: str | Path, live: bool = False) -> Engine:
+def build_engine(path: str | Path, live: bool = False, clock=None, offline: bool = False) -> Engine:
+    """Build the engine from a config file.
+
+    `offline=True` (backtests) builds paper venues with no data source, so no
+    network, API keys or venue SDKs are needed, and everything that reads the
+    time uses `clock`.
+    """
+    clock = clock or time.time
     cfg = tomllib.loads(Path(path).read_text())
+    if offline and live:
+        raise ConfigError("offline (backtest) engines can't trade live")
     eng_cfg = cfg.get("engine", {})
     mode = eng_cfg.get("mode", "paper")
     if mode not in ("paper", "live"):
@@ -162,7 +176,7 @@ def build_engine(path: str | Path, live: bool = False) -> Engine:
         )
 
     market = None
-    if "synthetic" in cfg:
+    if "synthetic" in cfg and not offline:
         from .exchanges.synthetic import SyntheticMarket
 
         s = cfg["synthetic"]
@@ -176,10 +190,15 @@ def build_engine(path: str | Path, live: bool = False) -> Engine:
     for name, vcfg in cfg.get("venues", {}).items():
         if vcfg.get("allow_short", False):
             short_venues.add(name)
-        cal = _build_calendar(name, vcfg, cfg.get("market_calendar", {}))
+        cal = _build_calendar(name, vcfg, cfg.get("market_calendar", {}), clock)
         if cal is not None:
             calendars[name] = cal
-        adapter = _build_live_adapter(name, vcfg, live, market)
+        if offline:
+            adapter = None
+            quote = vcfg.get("quote_currency") or DEFAULT_QUOTE.get(vcfg.get("kind"), "USD")
+        else:
+            adapter = _build_live_adapter(name, vcfg, live, market)
+            quote = adapter.quote_currency
         if live:
             if vcfg.get("kind") == "synthetic":
                 raise ConfigError(f"venue {name}: synthetic venues cannot trade live")
@@ -190,10 +209,11 @@ def build_engine(path: str | Path, live: bool = False) -> Engine:
                 data_source=adapter,
                 balances=_dec(vcfg.get("paper_balances")),
                 taker_fee=Decimal(str(vcfg.get("taker_fee", 0))),
-                quote_currency=adapter.quote_currency,
+                quote_currency=quote,
                 allow_short=vcfg.get("allow_short", False),
                 short_initial_margin=Decimal(str(vcfg.get("short_initial_margin", "0.5"))),
                 borrow_rate_annual=Decimal(str(vcfg.get("borrow_rate_annual", 0))),
+                clock=clock,
             )
     if not exchanges:
         raise ConfigError("no [venues] configured")
@@ -210,14 +230,21 @@ def build_engine(path: str | Path, live: bool = False) -> Engine:
     limits = RiskLimits(
         **{k: Decimal(str(v)) if isinstance(getattr(RiskLimits, k, None), Decimal) else v for k, v in r.items()}
     )
+    if offline:
+        limits = dataclasses.replace(limits, kill_switch_file=None)  # a stray KILL file shouldn't skew a backtest
     risk = RiskManager(
-        limits, assets_of=lambda v, s: exchanges[v].assets(s), calendars=calendars, short_venues=short_venues
+        limits, assets_of=lambda v, s: exchanges[v].assets(s), clock=clock, calendars=calendars,
+        short_venues=short_venues,
     )
-    return Engine(
+    rec = cfg.get("recording", {})
+    recorder = None
+    if rec.get("enabled", False) and not offline:
+        recorder = Recorder(rec.get("path", "data/recordings"), rec.get("min_interval_s", 0.0))
+    engine = Engine(
         exchanges,
         strategies,
         risk,
-        journal=Journal(eng_cfg.get("journal")),
+        journal=Journal(None if offline else eng_cfg.get("journal"), clock),
         poll_interval_s=eng_cfg.get("poll_interval_s", 2.0),
         book_depth=eng_cfg.get("book_depth", 10),
         unwind_slippage_bps=Decimal(str(eng_cfg.get("unwind_slippage_bps", 50))),
@@ -227,3 +254,5 @@ def build_engine(path: str | Path, live: bool = False) -> Engine:
         balance_refresh_s=eng_cfg.get("balance_refresh_s", 30.0),
         warmup_timeout_s=eng_cfg.get("warmup_timeout_s", 15.0),
     )
+    engine.recorder = recorder
+    return engine

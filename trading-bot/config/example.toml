@@ -17,6 +17,13 @@ book_depth = 10
 journal = "data/journal.jsonl"
 unwind_slippage_bps = 50
 
+# Record every book update while trading, for backtests (`tradebot backtest`).
+# Or collect data without trading: `tradebot record -c config/local.toml`.
+[recording]
+enabled = false
+path = "data/recordings"       # one gzip file per UTC day
+min_interval_s = 0             # >0 downsamples each book (smaller files, coarser replay)
+
 [risk]
 max_order_notional = 500       # USD per order
 max_position_notional = 2000   # USD per asset per venue

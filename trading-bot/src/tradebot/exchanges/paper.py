@@ -22,7 +22,7 @@ from __future__ import annotations
 import time
 import uuid
 from collections import defaultdict
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from decimal import Decimal
 
 from ..models import ZERO, Order, OrderBook, OrderRequest, OrderStatus, Side, TimeInForce
@@ -54,6 +54,9 @@ class PaperExchange(Exchange):
         self.clock = clock
         self._last_px: dict[str, Decimal] = {}  # asset -> last fill price, for valuing shorts
         self._accrued_to = clock()
+        # Backtests set this to fill against the book as it was `latency` later
+        # than the decision, instead of the book that triggered it.
+        self.fill_book: Callable[[str], OrderBook | None] | None = None
 
     def set_order_book(self, book: OrderBook) -> None:
         """Inject a book directly (tests, demos, replaying recorded data)."""
@@ -99,9 +102,9 @@ class PaperExchange(Exchange):
         return None  # orders never rest in the simulator
 
     async def place_order(self, req: OrderRequest) -> Order:
-        order = Order(request=req, id=f"paper-{uuid.uuid4().hex[:12]}")
+        order = Order(request=req, id=f"paper-{uuid.uuid4().hex[:12]}", ts=self.clock())
         self.orders.append(order)
-        book = self._books.get(req.symbol)
+        book = (self.fill_book and self.fill_book(req.symbol)) or self._books.get(req.symbol)
         if book is None:
             return self._reject(order, "no market data")
 

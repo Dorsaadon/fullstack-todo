@@ -12,11 +12,15 @@ import asyncio
 import logging
 import time
 from collections import defaultdict
+from collections.abc import Callable
 
 from .exchanges.base import Exchange
 from .models import OrderBook
 
 log = logging.getLogger(__name__)
+
+# Called for every update: (venue, book or None for a heartbeat, receive time).
+Listener = Callable[[str, OrderBook | None, float], None]
 
 
 class MarketDataHub:
@@ -36,6 +40,7 @@ class MarketDataHub:
         self.books: dict[tuple[str, str], OrderBook] = {}
         self.alive: dict[tuple[str, str], float] = {}
         self.reconnects: dict[str, int] = defaultdict(int)
+        self.listeners: list[Listener] = []  # e.g. the recorder
         self._dirty: set[tuple[str, str]] = set()
         self._event = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
@@ -82,8 +87,11 @@ class MarketDataHub:
 
     def _on_book(self, venue: str, book: OrderBook) -> None:
         key = (venue, book.symbol)
+        now = self.clock()
         self.books[key] = book
-        self.alive[key] = self.clock()
+        self.alive[key] = now
+        for listener in self.listeners:
+            listener(venue, book, now)
         self._dirty.add(key)
         self._event.set()
 
@@ -98,6 +106,8 @@ class MarketDataHub:
                         now = self.clock()
                         for s in symbols:
                             self.alive[(venue, s)] = now
+                        for listener in self.listeners:
+                            listener(venue, None, now)
                     elif item.symbol in symbols:
                         self._on_book(venue, item)
                 log.warning("%s: stream ended; reconnecting", venue)

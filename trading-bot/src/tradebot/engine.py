@@ -62,6 +62,7 @@ class Engine:
         self.warmup_timeout_s = warmup_timeout_s
         self.hub = MarketDataHub(exchanges, book_depth) if data_mode == "stream" else None
         self._balances: dict[str, dict[str, Decimal]] = {}
+        self.recorder = None  # recording.Recorder; set by config when [recording] enabled
         self._last_rejection: dict[str, str] = {}
         self._stop = asyncio.Event()
         for ex in exchanges.values():
@@ -96,13 +97,16 @@ class Engine:
 
     async def _run_streaming(self, max_ticks: int | None) -> None:
         subs = self.subscriptions()
+        if self.recorder:
+            self.hub.listeners.append(self.recorder.on_event)
+            self.recorder.start()
         await self.hub.start(subs)
         # Don't value the account (or set the daily-loss baseline) until every
         # book has arrived; a partial first valuation would hide later losses.
         missing = await self.hub.warm_up(subs, self.warmup_timeout_s)
         if missing:
             log.warning("no data yet for %s; strategies using them wait", sorted(missing))
-        await self._refresh_balances(list(self.exchanges))
+        await self.refresh_balances(list(self.exchanges))
         last_balance_refresh = time.monotonic()
         ticks = 0
         try:
@@ -114,7 +118,7 @@ class Engine:
                     await asyncio.sleep(self.min_tick_interval_s)  # let a burst settle
                 dirty = self.hub.take_dirty()
                 if time.monotonic() - last_balance_refresh > self.balance_refresh_s:
-                    await self._refresh_balances(list(self.exchanges))
+                    await self.refresh_balances(list(self.exchanges))
                     last_balance_refresh = time.monotonic()
                 try:
                     await self.tick(self.stream_snapshot(), only=dirty)
@@ -123,12 +127,14 @@ class Engine:
                 ticks += 1
         finally:
             await self.hub.stop()
+            if self.recorder:
+                await self.recorder.close()
 
     def stream_snapshot(self) -> MarketSnapshot:
         # Balances are shared, not copied, so post-trade refreshes update the cache.
         return MarketSnapshot(dict(self.hub.books), self._balances, alive=dict(self.hub.alive))
 
-    async def _refresh_balances(self, venues: list[str]) -> None:
+    async def refresh_balances(self, venues: list[str]) -> None:
         results = await asyncio.gather(*(self.exchanges[v].fetch_balances() for v in venues), return_exceptions=True)
         for v, res in zip(venues, results):
             if isinstance(res, BaseException):
@@ -138,6 +144,15 @@ class Engine:
                 self._balances[v] = res
 
     async def _run_polling(self, max_ticks: int | None) -> None:
+        if self.recorder:
+            self.recorder.start()
+        try:
+            await self._poll_loop(max_ticks)
+        finally:
+            if self.recorder:
+                await self.recorder.close()
+
+    async def _poll_loop(self, max_ticks: int | None) -> None:
         ticks = 0
         while not self._stop.is_set() and (max_ticks is None or ticks < max_ticks):
             try:
@@ -164,6 +179,8 @@ class Engine:
                 log.warning("book %s:%s unavailable: %s", v, sym, res)
             else:
                 books[(v, sym)] = res
+                if self.recorder:
+                    self.recorder.on_event(v, res, time.time())
         for v, res in zip(venues, results[len(subs):]):
             if isinstance(res, BaseException):
                 log.warning("balances %s unavailable: %s", v, res)

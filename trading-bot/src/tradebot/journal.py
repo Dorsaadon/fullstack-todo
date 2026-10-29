@@ -21,8 +21,9 @@ def _default(o):
 
 
 class Journal:
-    def __init__(self, path: str | None):
+    def __init__(self, path: str | None, clock=time.time):
         self.path = Path(path) if path else None
+        self.clock = clock
         if self.path:
             self.path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -30,4 +31,4 @@ class Journal:
         if not self.path:
             return
         with self.path.open("a") as f:
-            f.write(json.dumps({"ts": time.time(), "event": event, **data}, default=_default) + "\n")
+            f.write(json.dumps({"ts": self.clock(), "event": event, **data}, default=_default) + "\n")
