@@ -1,0 +1,47 @@
+# systemd unit, for running without Docker.
+#   sudo cp deploy/tradebot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now tradebot
+#   journalctl -u tradebot -f
+#
+# Assumes: user "tradebot", code in /opt/tradebot/trading-bot, virtualenv in
+# /opt/tradebot/.venv (pip install -r requirements.lock && pip install --no-deps .).
+# Going live: add --live to ExecStart AND set engine.mode = "live" in the config.
+
+[Unit]
+Description=tradebot trading bot
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+# Give up (and stay down) after 5 crashes in 10 minutes rather than crash-loop.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=tradebot
+Group=tradebot
+WorkingDirectory=/opt/tradebot/trading-bot
+EnvironmentFile=/opt/tradebot/trading-bot/.env
+ExecStart=/opt/tradebot/.venv/bin/python -m tradebot run -c config/local.toml
+Environment=PYTHONUNBUFFERED=1
+
+# Restart after crashes, but not after a clean stop. A saved halt survives restarts.
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Hardening: read-only system, writable data dir only, no privilege escalation.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/opt/tradebot/trading-bot/data
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

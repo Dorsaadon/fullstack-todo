@@ -12,13 +12,20 @@ import asyncio
 import logging
 import re
 import time
+from collections import Counter, defaultdict
+from datetime import datetime
+from datetime import time as dtime
 from decimal import Decimal
 
+from .alerts import Alerter
 from .exchanges.base import Exchange
+from .exchanges.paper import PaperExchange
 from .journal import Journal
+from .market_hours import NEW_YORK
 from .marketdata import MarketDataHub
-from .models import MarketSnapshot, Order, OrderRequest, OrderStatus, Side, TimeInForce, TradePlan
+from .models import ZERO, MarketSnapshot, Order, OrderRequest, OrderStatus, Side, TimeInForce, TradePlan
 from .risk import RiskManager, equity, usd_prices
+from .state import StateStore
 from .strategies.base import Strategy
 
 log = logging.getLogger(__name__)
@@ -63,6 +70,15 @@ class Engine:
         self.hub = MarketDataHub(exchanges, book_depth) if data_mode == "stream" else None
         self._balances: dict[str, dict[str, Decimal]] = {}
         self.recorder = None  # recording.Recorder; set by config when [recording] enabled
+        self.alerts = Alerter()  # logs only, until [alerts] configures channels
+        self.state: StateStore | None = None  # set by config ([engine] state_file)
+        self.state_save_s = 10.0
+        self.daily_summary_time: dtime | None = None  # America/New_York
+        self._last_save = 0.0
+        self._last_tick = time.monotonic()
+        self._plans_today: Counter = Counter()
+        self._summary_day = None
+        risk.on_halt.append(self._on_halt)
         self._last_rejection: dict[str, str] = {}
         self._stop = asyncio.Event()
         for ex in exchanges.values():
@@ -76,6 +92,7 @@ class Engine:
         return self.exchanges[venue].assets(symbol)
 
     async def start(self) -> None:
+        self.restore_state()  # first: a corrupt state file should stop us before we connect
         await asyncio.gather(*(ex.connect() for ex in self.exchanges.values()))
 
     async def close(self) -> None:
@@ -90,10 +107,135 @@ class Engine:
         return sorted({sub for s in self.strategies for sub in s.subscriptions()})
 
     async def run(self, max_ticks: int | None = None) -> None:
+        await self.alerts.start()
+        stuck_after = max(60.0, 10 * self.heartbeat_s, 5 * self.poll_interval_s)
+        self.alerts.alive = lambda: time.monotonic() - self._last_tick < stuck_after
         if self.hub:
-            await self._run_streaming(max_ticks)
+            self.hub.on_status = self._on_venue_status
+        try:
+            if self.hub:
+                await self._run_streaming(max_ticks)
+            else:
+                await self._run_polling(max_ticks)
+        finally:
+            self.save_state()
+            self.alerts.send("info", "stopped")
+            await self.alerts.close()
+
+    # --- state, reconciliation, alerts -------------------------------------------
+
+    def restore_state(self) -> None:
+        """Load saved state, if any. Call before trading (start() does)."""
+        if self.state is None:
+            return
+        data = self.state.load()
+        if not data:
+            log.info("no saved state in %s; starting fresh", self.state.path)
+            return
+        self.risk.set_state(data.get("risk", {}))
+        saved = data.get("strategies", {})
+        for s in self.strategies:
+            if s.name in saved:
+                s.set_state(saved[s.name])
+        for name, ex in self.exchanges.items():
+            if isinstance(ex, PaperExchange) and name in data.get("paper", {}):
+                ex.set_state(data["paper"][name])
+        log.info("restored state saved %.0fs ago", time.time() - data.get("saved_at", time.time()))
+
+    def collect_state(self) -> dict:
+        return {
+            "risk": self.risk.get_state(),
+            "strategies": {s.name: st for s in self.strategies if (st := s.get_state()) is not None},
+            "paper": {n: ex.get_state() for n, ex in self.exchanges.items() if isinstance(ex, PaperExchange)},
+        }
+
+    def save_state(self) -> None:
+        if self.state is None:
+            return
+        try:
+            self.state.save(self.collect_state())
+            self._last_save = time.monotonic()
+        except Exception:
+            log.exception("could not save state to %s", self.state.path)
+
+    async def reconcile(self) -> list[str]:
+        """Check positions the strategies must still close against the broker.
+
+        Where the broker holds less than the strategies think (filled while the
+        bot was down, closed by hand...), shrink the tracked positions to match,
+        so the bot never tries to sell shares that aren't there. Extra shares
+        at the broker are left alone: they may be yours. Call after balances
+        are fresh and before trading.
+        """
+        tracked: dict[tuple[str, str], list] = defaultdict(list)
+        for s in self.strategies:
+            for (venue, symbol), qty in s.positions().items():
+                if qty:
+                    tracked[(venue, self.assets_of(venue, symbol)[0])].append((s, symbol, qty))
+        issues = []
+        for (venue, asset), holders in tracked.items():
+            total = sum(q for _, _, q in holders)
+            actual = self._balances.get(venue, {}).get(asset, ZERO)
+            if len({q > 0 for _, _, q in holders}) > 1:
+                self.risk.halt(f"strategies hold opposite positions in {venue}:{asset}; resolve by hand")
+                continue
+            long = total > 0
+            if (actual >= total) if long else (actual <= total):
+                continue
+            remaining = max(actual, ZERO) if long else min(actual, ZERO)
+            for s, symbol, q in holders:
+                new = min(q, remaining) if long else max(q, remaining)
+                remaining -= new
+                s.set_position(venue, symbol, new)
+            msg = f"{venue}:{asset}: strategies tracked {fmt(total)} but the account holds {fmt(actual)}; adjusted to match"
+            issues.append(msg)
+            self.alerts.send("warning", f"position mismatch at startup. {msg}")
+        if issues:
+            self.save_state()
+        return issues
+
+    async def _prepare(self) -> None:
+        """Between first balances and first trade: reconcile and announce."""
+        await self.reconcile()
+        if self.risk.halted:
+            self.alerts.send(
+                "critical", f"started while HALTED ({self.risk.halt_reason}); "
+                "trading stays off until you run `tradebot state --clear-halt`",
+            )
+        names = ", ".join(s.name for s in self.strategies)
+        self.alerts.send("info", f"started: {len(self.strategies)} strategies ({names})")
+        now_et = datetime.now(NEW_YORK)
+        if self.daily_summary_time and now_et.time() >= self.daily_summary_time:
+            self._summary_day = now_et.date()  # today's summary time already passed
+
+    def _on_halt(self, reason: str) -> None:
+        self.alerts.send("critical", f"TRADING HALTED: {reason}")
+        self.alerts.fail(reason)
+        self.save_state()
+
+    def _on_venue_status(self, venue: str, ok: bool, detail: str) -> None:
+        if ok:
+            self.alerts.send("warning", f"{venue}: {detail}")
         else:
-            await self._run_polling(max_ticks)
+            self.alerts.send("critical", f"{venue} market data DOWN: {detail}")
+
+    def _after_tick(self) -> None:
+        self._last_tick = time.monotonic()
+        if self.state and time.monotonic() - self._last_save >= self.state_save_s:
+            self.save_state()
+        if self.daily_summary_time:
+            now_et = datetime.now(NEW_YORK)
+            if now_et.time() >= self.daily_summary_time and self._summary_day != now_et.date():
+                self._summary_day = now_et.date()
+                self.alerts.send("summary", self.summary())
+                self._plans_today.clear()
+
+    def summary(self) -> str:
+        r = self.risk
+        plans = ", ".join(f"{k} {v}" for k, v in sorted(self._plans_today.items())) or "none"
+        eq = f"${r.equity:,.2f}" if r.equity is not None else "n/a"
+        status = f"HALTED: {r.halt_reason}" if r.halted else "trading"
+        return f"daily summary: equity {eq}, P&L today ${r.daily_pnl:+,.2f}, trades: {plans}; {status}"
 
     async def _run_streaming(self, max_ticks: int | None) -> None:
         subs = self.subscriptions()
@@ -107,6 +249,7 @@ class Engine:
         if missing:
             log.warning("no data yet for %s; strategies using them wait", sorted(missing))
         await self.refresh_balances(list(self.exchanges))
+        await self._prepare()
         last_balance_refresh = time.monotonic()
         ticks = 0
         try:
@@ -124,6 +267,7 @@ class Engine:
                     await self.tick(self.stream_snapshot(), only=dirty)
                 except Exception:
                     log.exception("tick failed")
+                self._after_tick()
                 ticks += 1
         finally:
             await self.hub.stop()
@@ -153,12 +297,15 @@ class Engine:
                 await self.recorder.close()
 
     async def _poll_loop(self, max_ticks: int | None) -> None:
+        await self.refresh_balances(list(self.exchanges))
+        await self._prepare()
         ticks = 0
         while not self._stop.is_set() and (max_ticks is None or ticks < max_ticks):
             try:
                 await self.tick()
             except Exception:
                 log.exception("tick failed")
+            self._after_tick()
             ticks += 1
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.poll_interval_s)
@@ -221,6 +368,8 @@ class Engine:
                 orders = await self.execute(plan)
                 strat.on_orders(plan, orders)
                 executed.append((plan, orders))
+                self._plans_today[strat.name] += 1
+                self.save_state()  # positions changed: persist before anything else can go wrong
                 # The next strategy must see post-trade inventory.
                 touched = {leg.venue for leg in plan.legs}
                 for v in touched:
@@ -263,6 +412,7 @@ class Engine:
             px = top.price * (1 - self.unwind_slippage if side is Side.SELL else 1 + self.unwind_slippage)
             fix = OrderRequest(req.venue, req.symbol, side, excess, px, TimeInForce.IOC, strategy=f"{plan.strategy}:unwind")
             log.warning("  legging: unwinding %s %s on %s", excess, req.symbol, req.venue)
+            self.alerts.send("warning", f"{plan.strategy}: uneven fill, unwinding {fmt(excess)} {req.symbol} on {req.venue}")
             res = await ex.place_order(fix)
             self.journal.write("unwind", order=res)
             if res.filled + DUST < excess:

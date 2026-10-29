@@ -48,6 +48,7 @@ class RiskManager:
         self.limits = limits
         self.calendars = calendars or {}  # venue -> trading hours; absent = 24/7
         self.short_venues = short_venues or set()
+        self.on_halt: list = []  # callbacks(reason), e.g. alerts and an immediate state save
         self.assets_of = assets_of
         self.clock = clock
         self.halted = False
@@ -60,7 +61,27 @@ class RiskManager:
     def halt(self, reason: str) -> None:
         if not self.halted:
             log.critical("TRADING HALTED: %s", reason)
-        self.halted, self.halt_reason = True, reason
+            self.halted, self.halt_reason = True, reason
+            for callback in self.on_halt:
+                callback(reason)
+
+    def clear_halt(self) -> None:
+        self.halted, self.halt_reason = False, ""
+
+    def get_state(self) -> dict:
+        return {
+            "day": self._day,
+            "day_start_equity": str(self.day_start_equity) if self.day_start_equity is not None else None,
+            "halted": self.halted,
+            "halt_reason": self.halt_reason,
+        }
+
+    def set_state(self, state: dict) -> None:
+        self._day = state.get("day")
+        dse = state.get("day_start_equity")
+        self.day_start_equity = Decimal(dse) if dse is not None else None
+        self.halted = state.get("halted", False)
+        self.halt_reason = state.get("halt_reason", "")
 
     def update_equity(self, equity: Decimal) -> None:
         day = datetime.fromtimestamp(self.clock(), timezone.utc).date().isoformat()

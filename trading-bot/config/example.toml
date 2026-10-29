@@ -16,6 +16,17 @@ poll_interval_s = 2            # REST cadence for venues without WebSockets
 book_depth = 10
 journal = "data/journal.jsonl"
 unwind_slippage_bps = 50
+state_file = "data/state.json"  # halts, daily-loss baseline, open positions, paper balances
+state_save_s = 10               # also saved after every trade and on every halt
+
+# Alerts to your phone. Secrets come from .env; leave a channel out to disable it.
+[alerts]
+telegram_token_env = "TELEGRAM_BOT_TOKEN"
+telegram_chat_id_env = "TELEGRAM_CHAT_ID"
+slack_webhook_env = "SLACK_WEBHOOK_URL"
+healthcheck_url_env = "HEALTHCHECK_URL"   # e.g. a healthchecks.io check, period 1 min, grace 3 min
+min_level = "warning"                     # info | warning | critical
+daily_summary_time = "16:10"              # America/New_York; always sent
 
 # Record every book update while trading, for backtests (`tradebot backtest`).
 # Or collect data without trading: `tradebot record -c config/local.toml`.
@@ -31,7 +42,7 @@ max_daily_loss = 100           # halts for the day (until restart) once hit
 max_orders_per_minute = 20
 max_book_age_s = 3
 min_plan_profit = 0.10         # USD; skip arbs too small to beat noise
-kill_switch_file = "KILL"      # `touch KILL` stops all trading immediately
+kill_switch_file = "data/KILL" # `touch data/KILL` stops all trading (works from the host with Docker too)
 
 # --- Crypto -----------------------------------------------------------------
 # US residents: use exchange_id = "binanceus". Check the fee tier on your account.

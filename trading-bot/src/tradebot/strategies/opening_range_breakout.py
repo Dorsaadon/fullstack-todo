@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from decimal import ROUND_DOWN, Decimal
 
 from ..market_hours import MarketCalendar
@@ -43,6 +43,15 @@ class _Day:
     target: Decimal | None = None
     traded: bool = False  # one round trip per day
     skipped: str = ""  # why today was skipped, if it was
+    leftover: bool = False  # position carried over from an earlier session: close it now
+
+    def to_json(self) -> dict:
+        return {k: (str(v) if isinstance(v, Decimal) else v) for k, v in asdict(self).items()}
+
+    @classmethod
+    def from_json(cls, d: dict) -> _Day:
+        dec = {"high", "low", "position", "entry", "stop", "target"}
+        return cls(**{k: (Decimal(v) if k in dec and v is not None else v) for k, v in d.items()})
 
 
 class OpeningRangeBreakout(Strategy):
@@ -103,11 +112,13 @@ class OpeningRangeBreakout(Strategy):
                 continue
             st = self.days.get(symbol)
             if st is None or st.session_open != session.open_ts:
-                if st is not None and st.position != 0:
-                    # Can't happen with a flatten window; flag it rather than forget the shares.
-                    log.error("%s: %s still has a position of %s from the previous session", self.name, symbol, st.position)
+                carried = st.position if st is not None else ZERO
                 st = self.days[symbol] = _Day(session.open_ts)
-                if since_open > self.range_minutes:
+                if carried:
+                    # Missed the flatten (e.g. the bot was down at the close): exit at the open.
+                    log.warning("%s: %s position %s survived into a new session; closing it", self.name, symbol, carried)
+                    st.position, st.leftover = carried, True
+                elif since_open > self.range_minutes:
                     st.skipped = "started after the opening range"
             plan = self._evaluate(symbol, st, book, since_open, to_close, cash)
             if plan:
@@ -116,6 +127,12 @@ class OpeningRangeBreakout(Strategy):
         return plans
 
     def _evaluate(self, symbol, st: _Day, book, since_open, to_close, cash) -> TradePlan | None:
+        if st.leftover:
+            if st.position != 0:
+                return self._close(symbol, st, book, "left over from a previous session")
+            st.leftover = False
+            if since_open > self.range_minutes:
+                st.skipped = "opening range missed while closing a leftover position"
         if st.skipped:
             return None
         if since_open < self.range_minutes:
@@ -173,10 +190,31 @@ class OpeningRangeBreakout(Strategy):
             why = f"target: {px} reached {st.target}"
         else:
             return None
+        return self._close(symbol, st, book, why)
+
+    def _close(self, symbol, st: _Day, book, why: str) -> TradePlan | None:
+        long = st.position > 0
+        top = book.best_bid if long else book.best_ask
+        if top is None:
+            return None
+        px = top.price
         side = Side.SELL if long else Side.BUY
         limit = px * (ONE - self.slippage) if long else px * (ONE + self.slippage)
         leg = OrderRequest(self.venue, symbol, side, abs(st.position), limit, strategy=self.name)
         return TradePlan(self.name, (leg,), atomic=False, reason=f"ORB {'exit' if long else 'cover'} {symbol}: {why}")
+
+    def get_state(self) -> dict:
+        return {"days": {sym: st.to_json() for sym, st in self.days.items()}}
+
+    def set_state(self, state: dict) -> None:
+        self.days = {sym: _Day.from_json(d) for sym, d in state.get("days", {}).items()}
+
+    def positions(self) -> dict[tuple[str, str], Decimal]:
+        return {(self.venue, sym): st.position for sym, st in self.days.items() if st.position}
+
+    def set_position(self, venue: str, symbol: str, size: Decimal) -> None:
+        if venue == self.venue and symbol in self.days:
+            self.days[symbol].position = size
 
     def on_orders(self, plan: TradePlan, orders: list[Order]) -> None:
         for o in orders:

@@ -16,7 +16,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[all,dev]"
 
 python -m tradebot run -c config/demo.toml --ticks 150  # offline, no keys
-pytest                                                  # 74 tests
+pytest                                                  # 88 tests
 ```
 
 ## Architecture
@@ -43,6 +43,8 @@ pytest                                                  # 74 tests
 | Engine | `engine.py` | Event-driven loop. Fires a plan's legs concurrently and **unwinds uneven fills** (legging risk). |
 | Recording | `recording.py` | Writes every book update to daily gzip files; reads them back. |
 | Backtest | `backtest.py` | Replays recordings through the real engine on a simulated clock, with a latency model. |
+| State | `state.py` | Saves halts, the daily-loss baseline, positions and paper balances; single-instance lock. |
+| Alerts | `alerts.py` | Telegram / Slack alerts, daily summary, dead-man's-switch pings. |
 | Config | `config.py`, `config/*.toml` | Everything is declared in TOML. Secrets come from env vars. |
 
 ## Streaming market data
@@ -72,6 +74,21 @@ How it stays safe:
 
 `data_mode = "poll"` keeps the original REST loop. `tradebot check` always
 uses REST.
+
+## Running it for real
+
+See **[DEPLOY.md](DEPLOY.md)**: server setup, Docker Compose or systemd,
+alerts and the dead-man's switch, updates, backups and the rollout plan.
+
+- **Restarts are safe.** State is saved after every trade and every 10s, and
+  restored at startup. Open positions are checked against the broker before
+  the first trade.
+- **Halts survive restarts**, so auto-restart can't lift them. Clear one with
+  `tradebot state -c <config> --clear-halt`.
+- **One instance only:** a lock file stops a second copy trading the same account.
+- **Alerts** go out on halts, unwinds, venue outages and position mismatches,
+  plus a daily summary. A healthcheck ping, sent only while the trading loop
+  is alive, catches the bot dying.
 
 ## Recording and backtesting
 
@@ -231,9 +248,9 @@ opened themselves, so they never touch other holdings in the same account.
 2. Start with limits you'd be fine losing entirely: `max_order_notional = 50`,
    `max_daily_loss = 25`.
 3. API keys: **trade-only, withdrawals disabled, IP-whitelisted** to your server.
-4. Run it on a small cloud VM near the venue (Binance runs on AWS Tokyo,
-   Coinbase on AWS us-east-1) under `systemd` or Docker with auto-restart.
-5. `touch KILL` in the working directory halts everything on the next tick.
+4. Deploy per [DEPLOY.md](DEPLOY.md): Docker or systemd with auto-restart,
+   alerts on, and the dead-man's switch configured.
+5. `touch data/KILL` halts everything on the next tick.
 
 ### Phase 5: Scale what actually works
 Only grow the size of strategies with a live track record. Next strategies

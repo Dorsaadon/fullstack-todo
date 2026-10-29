@@ -41,6 +41,11 @@ class MarketDataHub:
         self.alive: dict[tuple[str, str], float] = {}
         self.reconnects: dict[str, int] = defaultdict(int)
         self.listeners: list[Listener] = []  # e.g. the recorder
+        # Called as (venue, ok, detail) when a venue goes down (`down_after`
+        # consecutive failed connections) and when it recovers.
+        self.on_status: Callable[[str, bool, str], None] | None = None
+        self.down_after = 3
+        self._failures: dict[str, int] = defaultdict(int)
         self._dirty: set[tuple[str, str]] = set()
         self._event = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
@@ -102,6 +107,10 @@ class MarketDataHub:
             try:
                 async for item in ex.watch_order_books(symbols, self.depth):
                     backoff = self.initial_backoff_s  # healthy again
+                    if self._failures[venue]:
+                        if self._failures[venue] >= self.down_after and self.on_status:
+                            self.on_status(venue, True, "market data restored")
+                        self._failures[venue] = 0
                     if item is None:
                         now = self.clock()
                         for s in symbols:
@@ -115,6 +124,9 @@ class MarketDataHub:
                 raise
             except Exception as e:
                 log.warning("%s: stream error (%s: %s); reconnecting in %.1fs", venue, type(e).__name__, e, backoff)
+                self._failures[venue] += 1
+                if self._failures[venue] == self.down_after and self.on_status:
+                    self.on_status(venue, False, f"{self._failures[venue]} failed connections in a row; last: {e}")
             self.reconnects[venue] += 1
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, self.max_backoff_s)

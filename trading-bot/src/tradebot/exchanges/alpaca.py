@@ -88,7 +88,10 @@ class AlpacaExchange(Exchange):
         account = await asyncio.to_thread(self.trading.get_account)
         positions = await asyncio.to_thread(self.trading.get_all_positions)
         balances = {"USD": Decimal(str(account.cash))}
-        balances.update({p.symbol: Decimal(str(p.qty)) for p in positions})
+        for p in positions:
+            qty = Decimal(str(p.qty))
+            side = getattr(getattr(p, "side", None), "value", getattr(p, "side", None))
+            balances[p.symbol] = -abs(qty) if side == "short" else qty  # shorts as negative quantities
         return balances
 
     async def cancel_order(self, order_id: str, symbol: str) -> None:

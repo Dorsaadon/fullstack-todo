@@ -76,6 +76,21 @@ class MeanReversion(Strategy):
             return [TradePlan(self.name, (leg,), atomic=False, reason=f"exit z={z:.2f}")]
         return []
 
+    def get_state(self) -> dict:
+        return {"shares": str(self.shares), "mids": list(self.mids), "last_ts": self._last_ts}
+
+    def set_state(self, state: dict) -> None:
+        self.shares = Decimal(state.get("shares", "0"))
+        self.mids.extend(state.get("mids", []))
+        self._last_ts = state.get("last_ts")
+
+    def positions(self) -> dict[tuple[str, str], Decimal]:
+        return {(self.venue, self.symbol): self.shares} if self.shares else {}
+
+    def set_position(self, venue: str, symbol: str, size: Decimal) -> None:
+        if (venue, symbol) == (self.venue, self.symbol):
+            self.shares = size
+
     def on_orders(self, plan: TradePlan, orders: list[Order]) -> None:
         for o in orders:
             if o.request.side is Side.BUY:

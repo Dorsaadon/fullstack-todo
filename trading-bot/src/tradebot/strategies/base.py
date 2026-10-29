@@ -32,6 +32,23 @@ class Strategy(ABC):
     def on_orders(self, plan: TradePlan, orders: list[Order]) -> None:
         """Called after a plan executes. Override to track state."""
 
+    # --- persistence (see state.py) ------------------------------------------
+
+    def get_state(self) -> dict | None:
+        """JSON-serializable state to survive a restart. None if stateless."""
+        return None
+
+    def set_state(self, state: dict) -> None:
+        """Restore what get_state returned."""
+
+    def positions(self) -> dict[tuple[str, str], Decimal]:
+        """Positions this strategy opened and must still close: (venue, symbol)
+        -> signed size in base units. Checked against the broker at startup."""
+        return {}
+
+    def set_position(self, venue: str, symbol: str, size: Decimal) -> None:
+        """Correct a tracked position after reconciliation found less at the broker."""
+
 
 def bps(x: Decimal) -> Decimal:
     return x * Decimal("10000")

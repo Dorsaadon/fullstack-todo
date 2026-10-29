@@ -7,15 +7,18 @@ import inspect
 import os
 import time
 import tomllib
+from datetime import time as dtime
 from decimal import Decimal
 from pathlib import Path
 
+from .alerts import Alerter
 from .engine import Engine
 from .exchanges.base import Exchange
 from .exchanges.paper import PaperExchange
 from .journal import Journal
 from .market_hours import MarketCalendar, RollingSessionCalendar
 from .recording import Recorder
+from .state import StateStore
 from .risk import RiskLimits, RiskManager
 from .strategies import (
     CrossExchangeArbitrage,
@@ -154,6 +157,26 @@ def _build_strategy(
     return cls(fees=fees, **cfg)
 
 
+def _build_alerter(cfg: dict) -> Alerter:
+    def env(key):
+        var = cfg.get(key)
+        return os.environ.get(var) if var else None
+
+    token, chat = env("telegram_token_env"), env("telegram_chat_id_env")
+    if bool(token) != bool(chat):
+        raise ConfigError("[alerts] Telegram needs both the bot token and the chat id set")
+    return Alerter(
+        telegram_token=token,
+        telegram_chat_id=chat,
+        slack_webhook=env("slack_webhook_env"),
+        healthcheck_url=env("healthcheck_url_env"),
+        min_level=cfg.get("min_level", "warning"),
+        dedupe_s=cfg.get("dedupe_s", 300.0),
+        healthcheck_interval_s=cfg.get("healthcheck_interval_s", 60.0),
+        name=cfg.get("name", "tradebot"),
+    )
+
+
 def build_engine(path: str | Path, live: bool = False, clock=None, offline: bool = False) -> Engine:
     """Build the engine from a config file.
 
@@ -222,6 +245,9 @@ def build_engine(path: str | Path, live: bool = False, clock=None, offline: bool
     strategies = [_build_strategy(s, fees, exchanges, calendars) for s in cfg.get("strategies", [])]
     if not strategies:
         raise ConfigError("no [[strategies]] configured")
+    names = [s.name for s in strategies]
+    if len(set(names)) != len(names):
+        raise ConfigError(f"strategy names must be unique (saved state is keyed by name): {names}")
     for s in strategies:
         if getattr(s, "allow_short", False) and s.venue not in short_venues:
             raise ConfigError(f"strategy {s.name} shorts, but venue {s.venue} lacks allow_short = true")
@@ -255,4 +281,11 @@ def build_engine(path: str | Path, live: bool = False, clock=None, offline: bool
         warmup_timeout_s=eng_cfg.get("warmup_timeout_s", 15.0),
     )
     engine.recorder = recorder
+    if not offline:
+        engine.state = StateStore(eng_cfg.get("state_file", "data/state.json"))
+        engine.state_save_s = eng_cfg.get("state_save_s", 10.0)
+        alerts_cfg = cfg.get("alerts", {})
+        engine.alerts = _build_alerter(alerts_cfg)
+        if alerts_cfg.get("daily_summary_time"):
+            engine.daily_summary_time = dtime.fromisoformat(alerts_cfg["daily_summary_time"])
     return engine

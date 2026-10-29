@@ -58,6 +58,21 @@ class PaperExchange(Exchange):
         # than the decision, instead of the book that triggered it.
         self.fill_book: Callable[[str], OrderBook | None] | None = None
 
+    def get_state(self) -> dict:
+        return {
+            "balances": {k: str(v) for k, v in self.balances.items() if v != 0},
+            "last_px": {k: str(v) for k, v in self._last_px.items()},
+            "borrow_fees_paid": str(self.borrow_fees_paid),
+            "accrued_to": self._accrued_to,
+        }
+
+    def set_state(self, state: dict) -> None:
+        """Restore a paper account; it replaces the config's paper_balances."""
+        self.balances = defaultdict(lambda: ZERO, {k: Decimal(v) for k, v in state.get("balances", {}).items()})
+        self._last_px = {k: Decimal(v) for k, v in state.get("last_px", {}).items()}
+        self.borrow_fees_paid = Decimal(state.get("borrow_fees_paid", "0"))
+        self._accrued_to = state.get("accrued_to", self._accrued_to)  # charge borrow for the downtime too
+
     def set_order_book(self, book: OrderBook) -> None:
         """Inject a book directly (tests, demos, replaying recorded data)."""
         self._books[book.symbol] = book

@@ -1,0 +1,42 @@
+# Run from trading-bot/:
+#   cp config/example.toml config/local.toml && cp .env.example .env   # then edit both
+#   mkdir -p data && sudo chown 1000:1000 data   # the container runs as uid 1000, not root
+#   docker compose up -d --build        # paper trading, with auto-restart
+#   docker compose logs -f tradebot
+#   docker compose exec tradebot python -m tradebot state -c config/local.toml
+#
+# Going live: set engine.mode = "live" in config/local.toml AND uncomment the
+# live command below. Both are required, by design.
+
+services:
+  tradebot:
+    build: .
+    container_name: tradebot          # one fixed name: compose never starts a second copy
+    restart: unless-stopped           # back after crashes and reboots; a saved halt still holds
+    env_file: .env
+    environment:
+      TRADEBOT_CONFIG: config/local.toml
+    # command: ["python", "-m", "tradebot", "run", "-c", "config/local.toml", "--live"]
+    volumes:
+      - ./data:/app/data              # state, journal, recordings: survives rebuilds
+      - ./config:/app/config:ro
+    stop_signal: SIGTERM
+    stop_grace_period: 30s            # time to finish a tick, save state, send the "stopped" alert
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+
+  # Optional: collect market data without trading.
+  #   docker compose --profile record up -d recorder
+  recorder:
+    build: .
+    profiles: ["record"]
+    restart: unless-stopped
+    env_file: .env
+    command: ["python", "-m", "tradebot", "record", "-c", "config/local.toml"]
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config:ro
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "3" }

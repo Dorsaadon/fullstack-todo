@@ -1,4 +1,4 @@
-"""Command line entry point: `tradebot run | check | record | backtest`."""
+"""Command line entry point: `tradebot run | check | record | backtest | state | health`."""
 
 from __future__ import annotations
 
@@ -12,10 +12,13 @@ from datetime import date, datetime
 
 from .config import ConfigError, build_engine, load_dotenv
 from .risk import equity, usd_prices
+from .state import InstanceLock, StateError
 
 
 async def _run(args) -> None:
     engine = build_engine(args.config, live=args.live)
+    lock = InstanceLock(engine.state.path.with_name("tradebot.lock"))
+    lock.acquire()  # never two bots on one account: every order would go out twice
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -57,6 +60,51 @@ async def _check(args) -> None:
                 print(f"  {s.name}: {p.reason}, expected {p.expected_profit:+.4f} -> {verdict}")
     finally:
         await engine.close()
+
+
+def _state(args) -> None:
+    engine = build_engine(args.config, live=args.live)
+    store = engine.state
+    if args.reset:
+        if not args.yes:
+            raise ConfigError("--reset forgets halts, open positions and paper balances; add --yes to confirm")
+        store.reset()
+        print(f"state reset: {store.path} removed")
+        return
+    data = store.load()
+    if not data:
+        print(f"no saved state at {store.path}")
+        return
+    if args.clear_halt:
+        if not data.get("risk", {}).get("halted"):
+            print("not halted; nothing to clear")
+        else:
+            data["risk"].update(halted=False, halt_reason="")
+            store.save({k: v for k, v in data.items() if k not in ("version", "saved_at")})
+            print("halt cleared; trading resumes on the next start (restart the bot if it's running)")
+            return
+    r = data.get("risk", {})
+    print(f"state file   {store.path} (saved {time.time() - data['saved_at']:.0f}s ago)")
+    print(f"status       {'HALTED: ' + r.get('halt_reason', '') if r.get('halted') else 'trading allowed'}")
+    print(f"day          {r.get('day')}  start-of-day equity {r.get('day_start_equity')}")
+    for s in engine.strategies:
+        if s.name in data.get("strategies", {}):
+            s.set_state(data["strategies"][s.name])
+        held = ", ".join(f"{v}:{sym} {q}" for (v, sym), q in s.positions().items()) or "flat"
+        print(f"strategy     {s.name:<20} {held}")
+    for name, acct in data.get("paper", {}).items():
+        print(f"paper        {name:<20} " + ", ".join(f"{a}={b}" for a, b in acct.get("balances", {}).items()))
+
+
+def _health(args) -> int:
+    """Exit 0 if the running bot saved state recently (Docker HEALTHCHECK)."""
+    engine = build_engine(args.config, live=args.live)
+    age = engine.state.age()
+    if age is None or age > args.max_age:
+        print(f"unhealthy: state last saved {'never' if age is None else f'{age:.0f}s ago'}")
+        return 1
+    print(f"healthy: state saved {age:.0f}s ago")
+    return 0
 
 
 def _on_signals(callback) -> None:
@@ -138,6 +186,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--seconds", type=float, help="stop after this long")
     p.add_argument("-v", "--verbose", action="store_true")
 
+    p = sub.add_parser("state", help="show saved state, clear a halt, or reset")
+    p.add_argument("-c", "--config", required=True)
+    p.add_argument("--live", action="store_true")
+    p.add_argument("--clear-halt", action="store_true", help="allow trading again after a halt")
+    p.add_argument("--reset", action="store_true", help="delete all saved state (needs --yes)")
+    p.add_argument("--yes", action="store_true")
+    p.add_argument("-v", "--verbose", action="store_true")
+
+    p = sub.add_parser("health", help="exit 0 if the bot saved state recently (for Docker)")
+    p.add_argument("-c", "--config", required=True)
+    p.add_argument("--live", action="store_true")
+    p.add_argument("--max-age", type=float, default=120.0, help="seconds (default 120)")
+    p.add_argument("-v", "--verbose", action="store_true")
+
     p = sub.add_parser("backtest", help="replay recorded data through the strategies")
     p.add_argument("-c", "--config", required=True)
     p.add_argument("--data", default="data/recordings", help="recording directory")
@@ -156,9 +218,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     load_dotenv()
     try:
+        if args.cmd == "state":
+            _state(args)
+            return 0
+        if args.cmd == "health":
+            return _health(args)
         commands = {"run": _run, "check": _check, "record": _record, "backtest": _backtest}
         asyncio.run(commands[args.cmd](args))
     except ConfigError as e:
         print(f"config error: {e}", file=sys.stderr)
+        return 2
+    except StateError as e:
+        print(f"state error: {e}", file=sys.stderr)
         return 2
     return 0
