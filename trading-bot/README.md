@@ -16,7 +16,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[all,dev]"
 
 python -m tradebot run -c config/demo.toml --ticks 150  # offline, no keys
-pytest                                                  # 53 tests
+pytest                                                  # 66 tests
 ```
 
 ## Architecture
@@ -78,7 +78,7 @@ uses REST.
 | `cross_exchange_arb` | crypto | Buy on venue A, sell on venue B at the same moment, from inventory pre-funded on both | One leg fills and the other doesn't. Inventory drifts to one side. |
 | `triangular_arb` | one crypto venue | USDT→BTC→ETH→USDT where the cross rate is mispriced | Edges are tiny and contested. Fees decide everything. |
 | `prediction_market_arb` | Polymarket | Outcomes are exhaustive and exactly one pays $1, so asks summing below $1 is locked-in profit | An outcome missing from the basket. Resolution or oracle disputes. Capital locked until resolution. |
-| `opening_range_breakout` | stocks | Record the first N minutes' high and low, buy the break above, stop at the low, flatten before the close | **Directional.** False breakouts are common; the stop and the daily flatten cap the damage. |
+| `opening_range_breakout` | stocks | Record the first N minutes' high and low, buy the break above (or short the break below), stop at the other side, flatten before the close | **Directional.** False breakouts are common; the stop and the daily flatten cap the damage. |
 | `mean_reversion` | stocks | Buy at z ≤ −entry, exit when price reverts | **Directional market risk.** It is not arbitrage. Backtest it first. |
 
 Every arbitrage strategy sizes trades by walking order-book depth, after fees.
@@ -90,18 +90,51 @@ It picks the size with the largest absolute profit that still clears
 The classic first day-trading bot. Each trading day, for each symbol:
 
 1. **Range:** track the high and low of the first `range_minutes` (5–30 is typical).
-2. **Entry:** buy when the ask clears the range high plus `breakout_buffer_bps`,
-   but only until `entry_cutoff_minutes` after the open. Days whose range is
-   narrower than `min_range_bps` or wider than `max_range_bps` are skipped.
-3. **Size by risk:** shares = `risk_per_trade` / (entry − range low), so a
+2. **Entry:** buy when the ask clears the range high plus `breakout_buffer_bps`.
+   With `allow_short = true`, also sell short when the bid breaks below the
+   range low. Entries only until `entry_cutoff_minutes` after the open. Days
+   whose range is narrower than `min_range_bps` or wider than `max_range_bps`
+   are skipped.
+3. **Size by risk:** shares = `risk_per_trade` / |entry − stop|, so a
    stopped-out trade loses about `risk_per_trade`. Capped by
    `max_position_notional` and cash.
-4. **Exit:** stop at the range low, target at `take_profit_r` × risk, and
-   always flatten `flatten_minutes_before_close` before the close (so 12:55
-   on a 1:00 pm early close). Nothing is held overnight.
+4. **Exit:** the stop is the other side of the range (the low for a long, the
+   high for a short). The target is `take_profit_r` × risk. Positions always
+   flatten `flatten_minutes_before_close` before the close (so 12:55 on a
+   1:00 pm early close). Nothing is held overnight.
 
-One round trip per symbol per day. Long only for now. If the bot starts after
-the opening range has ended, it sits that day out rather than guess the range.
+One round trip per symbol per day, on whichever side breaks first. If the bot
+starts after the opening range has ended, it sits that day out rather than
+guess the range.
+
+## Short selling
+
+Shorting is **off unless a venue opts in** with `allow_short = true`.
+
+- **Risk guard (paper and live):** on any other venue, a sell that would take a
+  position below zero is refused. This matters live: on an Alpaca margin
+  account, a strategy bug that oversells would otherwise silently open a short.
+- **Position limits are symmetric.** `max_position_notional` caps short
+  exposure like long exposure. Trades that shrink a position (stops, covers)
+  are never blocked by the cap.
+- **Paper simulation** models a US margin account:
+  - selling more than you hold opens a short, and the proceeds are credited to cash;
+  - **Reg T initial margin**: cash must cover 150% of the value of all open
+    shorts (`short_initial_margin = 0.5`). Orders that would breach it are cut
+    down (IOC) or rejected (FOK). Long holdings don't count as collateral,
+    which is stricter than a real broker;
+  - a **borrow fee** accrues on short value at `borrow_rate_annual`. About 0.3%
+    is typical for easy-to-borrow names; hard-to-borrow stocks can cost 10–100%+;
+  - buying covers the short first;
+  - only assets quoted in the venue's own currency can be shorted, so crypto
+    cross pairs can't create accidental shorts.
+- **Not modelled:** locate and borrow availability (every symbol is assumed
+  shortable), forced buy-ins, and maintenance-margin liquidation. The risk
+  manager's position and daily-loss limits are meant to stop you well before
+  a margin call.
+- **Live:** shorting on Alpaca needs a margin account, and the stock must be
+  "easy to borrow". Real short losses are unbounded, so keep
+  `max_position_notional` tight.
 
 ## Market hours
 
@@ -119,8 +152,8 @@ calendars.
   strategies can be watched end to end at any hour. The demo config uses it.
 - Only regular hours (9:30–16:00 ET) are modelled, not pre-market or after-hours.
 
-Both stock strategies (ORB and mean reversion) only ever sell shares they
-bought themselves, so they never touch other holdings in the same account.
+Both stock strategies (ORB and mean reversion) only ever close positions they
+opened themselves, so they never touch other holdings in the same account.
 
 ## The road from here: what to do, in order
 

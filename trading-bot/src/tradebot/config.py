@@ -30,7 +30,10 @@ STRATEGIES = {
     "opening_range_breakout": OpeningRangeBreakout,
 }
 
-VENUE_ONLY_KEYS = ("kind", "taker_fee", "paper_balances", "market_hours", "demo_session_minutes", "demo_gap_minutes")
+VENUE_ONLY_KEYS = (
+    "kind", "taker_fee", "paper_balances", "market_hours", "demo_session_minutes", "demo_gap_minutes",
+    "allow_short", "short_initial_margin", "borrow_rate_annual",
+)
 
 
 class ConfigError(ValueError):
@@ -169,7 +172,10 @@ def build_engine(path: str | Path, live: bool = False) -> Engine:
 
     exchanges: dict[str, Exchange] = {}
     calendars: dict[str, MarketCalendar] = {}
+    short_venues: set[str] = set()
     for name, vcfg in cfg.get("venues", {}).items():
+        if vcfg.get("allow_short", False):
+            short_venues.add(name)
         cal = _build_calendar(name, vcfg, cfg.get("market_calendar", {}))
         if cal is not None:
             calendars[name] = cal
@@ -185,6 +191,9 @@ def build_engine(path: str | Path, live: bool = False) -> Engine:
                 balances=_dec(vcfg.get("paper_balances")),
                 taker_fee=Decimal(str(vcfg.get("taker_fee", 0))),
                 quote_currency=adapter.quote_currency,
+                allow_short=vcfg.get("allow_short", False),
+                short_initial_margin=Decimal(str(vcfg.get("short_initial_margin", "0.5"))),
+                borrow_rate_annual=Decimal(str(vcfg.get("borrow_rate_annual", 0))),
             )
     if not exchanges:
         raise ConfigError("no [venues] configured")
@@ -193,12 +202,17 @@ def build_engine(path: str | Path, live: bool = False) -> Engine:
     strategies = [_build_strategy(s, fees, exchanges, calendars) for s in cfg.get("strategies", [])]
     if not strategies:
         raise ConfigError("no [[strategies]] configured")
+    for s in strategies:
+        if getattr(s, "allow_short", False) and s.venue not in short_venues:
+            raise ConfigError(f"strategy {s.name} shorts, but venue {s.venue} lacks allow_short = true")
 
     r = cfg.get("risk", {})
     limits = RiskLimits(
         **{k: Decimal(str(v)) if isinstance(getattr(RiskLimits, k, None), Decimal) else v for k, v in r.items()}
     )
-    risk = RiskManager(limits, assets_of=lambda v, s: exchanges[v].assets(s), calendars=calendars)
+    risk = RiskManager(
+        limits, assets_of=lambda v, s: exchanges[v].assets(s), calendars=calendars, short_venues=short_venues
+    )
     return Engine(
         exchanges,
         strategies,

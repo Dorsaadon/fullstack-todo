@@ -2,19 +2,20 @@
 
 For each symbol, every trading day:
   1. Record the high and low of the first `range_minutes` (the opening range).
-  2. Buy when the ask breaks above the range high (plus a small buffer),
-     but only before `entry_cutoff_minutes` after the open.
-  3. Stop out if the bid falls to the range low. Take profit at
-     `take_profit_r` times the risk (0 = no target).
+  2. Long: buy when the ask breaks above the range high (plus a small buffer).
+     Short (if `allow_short`): sell short when the bid breaks below the range
+     low. Entries only until `entry_cutoff_minutes` after the open.
+  3. The stop is the other side of the range. Take profit at `take_profit_r`
+     times the risk (0 = no target).
   4. Flatten everything `flatten_minutes_before_close` before the close, so
      no position is ever held overnight. Early closes are handled.
 
-Sizing is risk-based: shares = risk_per_trade / (entry - stop), capped by
-`max_position_notional` and available cash. One trade per symbol per day.
-Long only: the paper simulator can't short.
+Sizing is risk-based: shares = risk_per_trade / |entry - stop|, capped by
+`max_position_notional` and available cash. One trade per symbol per day:
+whichever side breaks first.
 
-The strategy only ever sells shares it bought itself, so it never touches
-other positions in the same account.
+The strategy only ever closes the position it opened itself, so it never
+touches other holdings in the same account.
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ class _Day:
     session_open: float  # identifies the session (several demo sessions share a date)
     high: Decimal | None = None
     low: Decimal | None = None
-    shares: Decimal = ZERO  # held by this strategy
+    position: Decimal = ZERO  # opened by this strategy: > 0 long, < 0 short
     entry: Decimal | None = None
     stop: Decimal | None = None
     target: Decimal | None = None
@@ -62,6 +63,7 @@ class OpeningRangeBreakout(Strategy):
         max_position_notional: Decimal = Decimal("5000"),
         take_profit_r: Decimal = Decimal("2"),
         max_slippage_bps: Decimal = Decimal("10"),
+        allow_short: bool = False,
         quote_currency: str = "USD",
     ):
         super().__init__(name, fees)
@@ -80,6 +82,7 @@ class OpeningRangeBreakout(Strategy):
         self.max_position_notional = max_position_notional
         self.take_profit_r = take_profit_r
         self.slippage = max_slippage_bps / 10_000
+        self.allow_short = allow_short
         self.quote = quote_currency
         self.days: dict[str, _Day] = {}
 
@@ -100,17 +103,16 @@ class OpeningRangeBreakout(Strategy):
                 continue
             st = self.days.get(symbol)
             if st is None or st.session_open != session.open_ts:
-                if st is not None and st.shares > 0:
+                if st is not None and st.position != 0:
                     # Can't happen with a flatten window; flag it rather than forget the shares.
-                    log.error("%s: %s still holds %s %s from the previous session", self.name, symbol, st.shares, symbol)
+                    log.error("%s: %s still has a position of %s from the previous session", self.name, symbol, st.position)
                 st = self.days[symbol] = _Day(session.open_ts)
                 if since_open > self.range_minutes:
                     st.skipped = "started after the opening range"
             plan = self._evaluate(symbol, st, book, since_open, to_close, cash)
             if plan:
                 plans.append(plan)
-                if plan.legs[0].side is Side.BUY:
-                    cash -= plan.legs[0].notional()
+                cash -= plan.legs[0].notional()  # budget shorts like longs: conservative
         return plans
 
     def _evaluate(self, symbol, st: _Day, book, since_open, to_close, cash) -> TradePlan | None:
@@ -125,7 +127,7 @@ class OpeningRangeBreakout(Strategy):
             st.skipped = "no prices during the opening range"
             return None
 
-        if st.shares > 0:
+        if st.position != 0:
             return self._exit(symbol, st, book, to_close)
         if st.traded or since_open > self.entry_cutoff_minutes or to_close <= self.flatten_minutes:
             return None
@@ -134,50 +136,58 @@ class OpeningRangeBreakout(Strategy):
         if not self.min_range_bps <= width <= self.max_range_bps:
             st.skipped = f"range {width:.0f} bps outside [{self.min_range_bps}, {self.max_range_bps}]"
             return None
-        ask = book.best_ask
-        if ask is None or ask.price <= st.high * (ONE + self.buffer):
-            return None
+        ask, bid = book.best_ask, book.best_bid
+        if ask is not None and ask.price > st.high * (ONE + self.buffer):
+            return self._enter(symbol, st, Side.BUY, ask.price, stop=st.low, cash=cash)
+        if self.allow_short and bid is not None and bid.price < st.low * (ONE - self.buffer):
+            return self._enter(symbol, st, Side.SELL, bid.price, stop=st.high, cash=cash)
+        return None
 
-        stop = st.low
-        risk_per_share = ask.price - stop
-        limit = ask.price * (ONE + self.slippage)
+    def _enter(self, symbol, st: _Day, side: Side, price: Decimal, stop: Decimal, cash: Decimal) -> TradePlan | None:
+        limit = price * (ONE + self.slippage) if side is Side.BUY else price * (ONE - self.slippage)
         affordable = cash / (limit * (ONE + self.fee(self.venue)))
-        shares = min(self.risk_per_trade / risk_per_share, self.max_position_notional / limit, affordable)
+        shares = min(self.risk_per_trade / abs(price - stop), self.max_position_notional / limit, affordable)
         shares = shares.quantize(ONE, rounding=ROUND_DOWN)
         if shares <= 0:
             return None
         st.stop = stop
-        leg = OrderRequest(self.venue, symbol, Side.BUY, shares, limit, strategy=self.name)
-        return TradePlan(
-            self.name, (leg,), atomic=False,
-            reason=f"ORB entry {symbol}: ask {ask.price} > range high {st.high} (stop {stop})",
-        )
+        leg = OrderRequest(self.venue, symbol, side, shares, limit, strategy=self.name)
+        if side is Side.BUY:
+            why = f"ORB long {symbol}: ask {price} > range high {st.high} (stop {stop})"
+        else:
+            why = f"ORB short {symbol}: bid {price} < range low {st.low} (stop {stop})"
+        return TradePlan(self.name, (leg,), atomic=False, reason=why)
 
     def _exit(self, symbol, st: _Day, book, to_close) -> TradePlan | None:
-        bid = book.best_bid
-        if bid is None:
+        long = st.position > 0
+        # A long exits by selling into the bid; a short covers by buying the ask.
+        top = book.best_bid if long else book.best_ask
+        if top is None:
             return None
+        px = top.price
         if to_close <= self.flatten_minutes:
             why = f"flatten {to_close:.1f} min before close"
-        elif bid.price <= st.stop:
-            why = f"stop: bid {bid.price} <= {st.stop}"
-        elif st.target is not None and bid.price >= st.target:
-            why = f"target: bid {bid.price} >= {st.target}"
+        elif (px <= st.stop) if long else (px >= st.stop):
+            why = f"stop: {px} through {st.stop}"
+        elif st.target is not None and ((px >= st.target) if long else (px <= st.target)):
+            why = f"target: {px} reached {st.target}"
         else:
             return None
-        leg = OrderRequest(self.venue, symbol, Side.SELL, st.shares, bid.price * (ONE - self.slippage), strategy=self.name)
-        return TradePlan(self.name, (leg,), atomic=False, reason=f"ORB exit {symbol}: {why}")
+        side = Side.SELL if long else Side.BUY
+        limit = px * (ONE - self.slippage) if long else px * (ONE + self.slippage)
+        leg = OrderRequest(self.venue, symbol, side, abs(st.position), limit, strategy=self.name)
+        return TradePlan(self.name, (leg,), atomic=False, reason=f"ORB {'exit' if long else 'cover'} {symbol}: {why}")
 
     def on_orders(self, plan: TradePlan, orders: list[Order]) -> None:
         for o in orders:
             st = self.days.get(o.request.symbol)
             if st is None or o.filled <= 0:
                 continue
-            if o.request.side is Side.BUY:
-                st.shares += o.filled
-                st.entry = o.avg_price or o.request.price
+            opening = st.position == 0 and not st.traded
+            st.position += o.filled if o.request.side is Side.BUY else -o.filled
+            if opening:
                 st.traded = True
+                st.entry = o.avg_price or o.request.price
                 if self.take_profit_r > 0:
+                    # entry - stop is negative for a short, putting the target below entry.
                     st.target = st.entry + self.take_profit_r * (st.entry - st.stop)
-            else:
-                st.shares = max(st.shares - o.filled, ZERO)

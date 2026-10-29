@@ -43,6 +43,8 @@ kind = "synthetic"
 quote_currency = "USD"
 market_hours = "demo"         # real config: "us_equities" (the default for kind = "alpaca")
 demo_session_minutes = 1
+allow_short = true            # paper margin account: 150% initial margin on shorts
+borrow_rate_annual = 0.03
 noise_bps = 25
 paper_balances = { USD = 25000 }
 
@@ -100,6 +102,7 @@ max_range_bps = 500
 risk_per_trade = 100
 max_position_notional = 4000
 take_profit_r = 1.5
+allow_short = true                  # also trade breakdowns below the range
 
 [[strategies]]
 kind = "mean_reversion"

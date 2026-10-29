@@ -56,6 +56,11 @@ extra_early_closes = []
 [venues.alpaca]
 kind = "alpaca"
 market_hours = "us_equities"   # orders refused outside regular hours (the default for alpaca)
+# Shorting: live, it needs an Alpaca margin account (and shares available to
+# borrow). Off by default; then any sell that would go below zero is refused.
+allow_short = false
+short_initial_margin = 0.5     # paper: Reg T, cash must cover 150% of open shorts
+borrow_rate_annual = 0.003     # paper: easy-to-borrow rate; hard-to-borrow names cost far more
 paper_account = true           # Alpaca's own paper account; false = real money
 feed = "iex"                   # "sip" needs a paid data plan
 api_key_env = "ALPACA_API_KEY"
@@ -113,6 +118,7 @@ risk_per_trade = 25            # USD lost if the stop is hit
 max_position_notional = 2000
 take_profit_r = 2              # 0 = hold until the flatten time
 max_slippage_bps = 10
+allow_short = false            # true = also short breakdowns (needs allow_short on the venue)
 
 [[strategies]]
 kind = "mean_reversion"

@@ -2,7 +2,9 @@
 
 Every TradePlan passes through `check` before any order is sent. Orders on a
 venue with a market calendar (US equities) are refused outside its session,
-whatever the strategy thinks. The manager halts all trading (until restarted) when the daily loss limit is hit, when the
+whatever the strategy thinks. A sell that would take a position below zero is
+refused unless the venue is configured for shorting, so a strategy bug can't
+open an accidental short on a margin account. The manager halts all trading (until restarted) when the daily loss limit is hit, when the
 kill-switch file appears, or when the engine reports an unrecoverable leg.
 """
 
@@ -41,9 +43,11 @@ class RiskManager:
         assets_of: AssetsOf,
         clock=time.time,
         calendars: dict[str, MarketCalendar] | None = None,
+        short_venues: set[str] | None = None,
     ):
         self.limits = limits
         self.calendars = calendars or {}  # venue -> trading hours; absent = 24/7
+        self.short_venues = short_venues or set()
         self.assets_of = assets_of
         self.clock = clock
         self.halted = False
@@ -112,8 +116,13 @@ class RiskManager:
             notional = leg.size * ref * prices[quote]
             if notional > self.limits.max_order_notional:
                 return f"order notional {notional:.2f} > {self.limits.max_order_notional}"
-            if leg.side is Side.BUY and base in prices:
-                after = (snap.balance(leg.venue, base) + leg.size) * prices[base]
-                if after > self.limits.max_position_notional:
-                    return f"position {leg.venue}:{base} would be {after:.2f} > {self.limits.max_position_notional}"
+            held = snap.balance(leg.venue, base)
+            after = held + leg.size if leg.side is Side.BUY else held - leg.size
+            if after < 0 and leg.venue not in self.short_venues:
+                return f"sell would open a short in {leg.venue}:{base}; shorting is not enabled there"
+            # Trades that shrink a position (stops, covers) are always allowed.
+            if abs(after) > abs(held) and base in prices:
+                exposure = abs(after) * prices[base]
+                if exposure > self.limits.max_position_notional:
+                    return f"position {leg.venue}:{base} would be {exposure:.2f} > {self.limits.max_position_notional}"
         return None
