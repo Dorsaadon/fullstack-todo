@@ -1,0 +1,106 @@
+"""Pre-trade risk checks and circuit breakers.
+
+Every TradePlan passes through `check` before any order is sent. The manager
+halts all trading (until restarted) when the daily loss limit is hit, when the
+kill-switch file appears, or when the engine reports an unrecoverable leg.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal
+from pathlib import Path
+
+from ..models import ZERO, MarketSnapshot, Side, TradePlan
+from .portfolio import AssetsOf
+
+log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RiskLimits:
+    max_order_notional: Decimal = Decimal("1000")  # USD per order
+    max_position_notional: Decimal = Decimal("5000")  # USD per asset per venue
+    max_daily_loss: Decimal = Decimal("250")  # USD drawdown from start-of-day equity
+    max_orders_per_minute: int = 30
+    max_book_age_s: float = 5.0
+    min_plan_profit: Decimal = ZERO  # USD-ish; atomic plans must expect at least this
+    kill_switch_file: str | None = "KILL"
+
+
+class RiskManager:
+    def __init__(self, limits: RiskLimits, assets_of: AssetsOf, clock=time.time):
+        self.limits = limits
+        self.assets_of = assets_of
+        self.clock = clock
+        self.halted = False
+        self.halt_reason = ""
+        self._order_times: deque[float] = deque()
+        self._day: str | None = None
+        self.day_start_equity: Decimal | None = None
+        self.equity: Decimal | None = None
+
+    def halt(self, reason: str) -> None:
+        if not self.halted:
+            log.critical("TRADING HALTED: %s", reason)
+        self.halted, self.halt_reason = True, reason
+
+    def update_equity(self, equity: Decimal) -> None:
+        day = datetime.fromtimestamp(self.clock(), timezone.utc).date().isoformat()
+        if day != self._day:
+            self._day, self.day_start_equity = day, equity
+        self.equity = equity
+        loss = self.day_start_equity - equity
+        if loss >= self.limits.max_daily_loss:
+            self.halt(f"daily loss {loss:.2f} >= limit {self.limits.max_daily_loss}")
+
+    @property
+    def daily_pnl(self) -> Decimal:
+        if self.equity is None or self.day_start_equity is None:
+            return ZERO
+        return self.equity - self.day_start_equity
+
+    def record_orders(self, n: int) -> None:
+        now = self.clock()
+        self._order_times.extend([now] * n)
+
+    def check(self, plan: TradePlan, snap: MarketSnapshot, prices: dict[str, Decimal]) -> str | None:
+        """Return None if the plan may trade, else the reason it may not."""
+        if self.limits.kill_switch_file and Path(self.limits.kill_switch_file).exists():
+            self.halt(f"kill switch file {self.limits.kill_switch_file!r} present")
+        if self.halted:
+            return f"halted: {self.halt_reason}"
+
+        now = self.clock()
+        while self._order_times and now - self._order_times[0] > 60:
+            self._order_times.popleft()
+        if len(self._order_times) + len(plan.legs) > self.limits.max_orders_per_minute:
+            return "order rate limit"
+
+        if plan.atomic and plan.expected_profit < self.limits.min_plan_profit:
+            return f"expected profit {plan.expected_profit:.4f} below minimum"
+
+        for leg in plan.legs:
+            book = snap.book(leg.venue, leg.symbol)
+            if book is None:
+                return f"no book for {leg.venue}:{leg.symbol}"
+            if book.age(now) > self.limits.max_book_age_s:
+                return f"stale book {leg.venue}:{leg.symbol} ({book.age(now):.1f}s old)"
+            base, quote = self.assets_of(leg.venue, leg.symbol)
+            if quote not in prices:
+                return f"cannot value {quote}"
+            ref = leg.price if leg.price is not None else book.mid
+            if ref is None:
+                return f"no reference price for {leg.venue}:{leg.symbol}"
+            notional = leg.size * ref * prices[quote]
+            if notional > self.limits.max_order_notional:
+                return f"order notional {notional:.2f} > {self.limits.max_order_notional}"
+            if leg.side is Side.BUY and base in prices:
+                after = (snap.balance(leg.venue, base) + leg.size) * prices[base]
+                if after > self.limits.max_position_notional:
+                    return f"position {leg.venue}:{base} would be {after:.2f} > {self.limits.max_position_notional}"
+        return None

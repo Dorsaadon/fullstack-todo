@@ -1,0 +1,93 @@
+# Fully offline demo: synthetic markets, paper execution, no API keys.
+#   python -m tradebot run -c config/demo.toml --ticks 30
+
+[engine]
+mode = "paper"
+poll_interval_s = 0.5
+journal = "data/demo-journal.jsonl"
+
+[risk]
+max_order_notional = 5000
+max_position_notional = 50000
+max_daily_loss = 500
+max_orders_per_minute = 120
+max_book_age_s = 5
+kill_switch_file = "KILL"
+
+[synthetic]
+seed = 7
+step_s = 0.5
+vol_bps = 4
+assets = { BTC = 65000, ETH = 3200, AAPL = 230 }
+outcome_sets = [["ELECTION_YES", "ELECTION_NO"], ["CUP_TEAM_A", "CUP_TEAM_B", "CUP_TEAM_C"]]
+
+[venues.binance]
+kind = "synthetic"
+quote_currency = "USDT"
+taker_fee = 0.001
+dislocation_prob = 0.15
+paper_balances = { USDT = 20000, BTC = 0.3, ETH = 3 }
+
+[venues.kraken]
+kind = "synthetic"
+quote_currency = "USDT"
+taker_fee = 0.0026
+dislocation_prob = 0.15
+paper_balances = { USDT = 20000, BTC = 0.3 }
+
+[venues.alpaca]
+kind = "synthetic"
+quote_currency = "USD"
+noise_bps = 25
+paper_balances = { USD = 25000 }
+
+[venues.polymarket]
+kind = "synthetic"
+quote_currency = "USDC"
+noise_bps = 30
+dislocation_prob = 0.05
+dislocation_bps = 150
+paper_balances = { USDC = 5000 }
+
+[[strategies]]
+kind = "cross_exchange_arb"
+name = "btc-cross-arb"
+symbol = "BTC/USDT"
+venues = ["binance", "kraken"]
+min_edge_bps = 5
+max_size = 0.05
+
+[[strategies]]
+kind = "triangular_arb"
+name = "usdt-btc-eth-tri"
+venue = "binance"
+path = ["USDT", "BTC", "ETH"]
+markets = ["BTC/USDT", "ETH/USDT", "ETH/BTC"]
+min_edge_bps = 5
+max_start_amount = 2000
+
+[[strategies]]
+kind = "prediction_market_arb"
+name = "election-basket"
+venue = "polymarket"
+outcomes = ["ELECTION_YES", "ELECTION_NO"]
+min_edge_bps = 30
+max_size = 500
+
+[[strategies]]
+kind = "prediction_market_arb"
+name = "cup-basket"
+venue = "polymarket"
+outcomes = ["CUP_TEAM_A", "CUP_TEAM_B", "CUP_TEAM_C"]
+min_edge_bps = 30
+max_size = 500
+
+[[strategies]]
+kind = "mean_reversion"
+name = "aapl-meanrev"
+venue = "alpaca"
+symbol = "AAPL"
+window = 20
+entry_z = 1.5
+exit_z = 0.0
+order_size = 10

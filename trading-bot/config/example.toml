@@ -1,0 +1,99 @@
+# Real venues. Start in paper mode: live market data, simulated fills.
+#   cp config/example.toml config/local.toml   (local.toml is gitignored)
+#   python -m tradebot check -c config/local.toml
+#   python -m tradebot run   -c config/local.toml
+#
+# Going live requires engine.mode = "live" here AND the --live flag.
+# Secrets come from environment variables (or a .env file), never this file.
+
+[engine]
+mode = "paper"
+poll_interval_s = 2
+book_depth = 10
+journal = "data/journal.jsonl"
+unwind_slippage_bps = 50
+
+[risk]
+max_order_notional = 500       # USD per order
+max_position_notional = 2000   # USD per asset per venue
+max_daily_loss = 100           # halts for the day (until restart) once hit
+max_orders_per_minute = 20
+max_book_age_s = 3
+min_plan_profit = 0.10         # USD; skip arbs too small to beat noise
+kill_switch_file = "KILL"      # `touch KILL` stops all trading immediately
+
+# --- Crypto -----------------------------------------------------------------
+# US residents: use exchange_id = "binanceus". Check the fee tier on your account.
+[venues.binance]
+kind = "ccxt"
+exchange_id = "binance"
+quote_currency = "USDT"
+taker_fee = 0.001
+sandbox = false                # true = Binance spot testnet (separate API keys)
+api_key_env = "BINANCE_API_KEY"
+secret_env = "BINANCE_API_SECRET"
+paper_balances = { USDT = 5000, BTC = 0.05, ETH = 1 }
+
+[venues.kraken]
+kind = "ccxt"
+exchange_id = "kraken"
+quote_currency = "USDT"
+taker_fee = 0.0026
+api_key_env = "KRAKEN_API_KEY"
+secret_env = "KRAKEN_API_SECRET"
+paper_balances = { USDT = 5000, BTC = 0.05 }
+
+# --- US equities ------------------------------------------------------------
+[venues.alpaca]
+kind = "alpaca"
+paper_account = true           # Alpaca's own paper account; false = real money
+feed = "iex"                   # "sip" needs a paid data plan
+api_key_env = "ALPACA_API_KEY"
+secret_env = "ALPACA_API_SECRET"
+paper_balances = { USD = 10000 }
+
+# --- Prediction markets -------------------------------------------------------
+# Symbols are CLOB token ids (one per outcome); find them via
+# https://gamma-api.polymarket.com/markets?slug=<market-slug> ("clobTokenIds").
+[venues.polymarket]
+kind = "polymarket"
+taker_fee = 0
+private_key_env = "POLYMARKET_PRIVATE_KEY"
+funder_env = "POLYMARKET_FUNDER"   # proxy wallet address, if you use one
+signature_type = 1                 # 0 = EOA, 1 = email/Magic, 2 = browser-wallet Safe
+paper_balances = { USDC = 1000 }
+
+[[strategies]]
+kind = "cross_exchange_arb"
+name = "btc-cross-arb"
+symbol = "BTC/USDT"
+venues = ["binance", "kraken"]
+min_edge_bps = 15
+max_size = 0.005
+
+[[strategies]]
+kind = "triangular_arb"
+name = "usdt-btc-eth-tri"
+venue = "binance"
+path = ["USDT", "BTC", "ETH"]
+markets = ["BTC/USDT", "ETH/USDT", "ETH/BTC"]
+min_edge_bps = 10
+max_start_amount = 200
+
+[[strategies]]
+kind = "prediction_market_arb"
+name = "pm-basket"
+venue = "polymarket"
+outcomes = ["<YES_TOKEN_ID>", "<NO_TOKEN_ID>"]
+min_edge_bps = 50
+max_size = 50
+
+[[strategies]]
+kind = "mean_reversion"
+name = "spy-meanrev"
+venue = "alpaca"
+symbol = "SPY"
+window = 60
+entry_z = 2.0
+exit_z = 0.0
+order_size = 1
